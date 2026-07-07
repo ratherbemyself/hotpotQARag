@@ -77,8 +77,8 @@ class DeepSeekClient(BaseLLMClient):
             LLMResponse 实例
         """
         config = get_config()
-        temperature = config.llm_temperature
-        max_tokens = config.llm_max_tokens
+        temperature = config.llm_temperature if temperature is None else temperature
+        max_tokens = config.llm_max_tokens if max_tokens is None else max_tokens
         
         start_time = time.time()
         
@@ -94,12 +94,14 @@ class DeepSeekClient(BaseLLMClient):
             
             latency = time.time() - start_time
             
-            content = response.choices[0].message.content
+            content = response.choices[0].message.content or ""
+            usage_obj = getattr(response, "usage", None)
             usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                "total_tokens": getattr(usage_obj, "total_tokens", 0),
             }
+            success = bool(content.strip())
             
             logger.debug(
                 f"LLM 生成完成: tokens={usage['total_tokens']}, "
@@ -111,7 +113,8 @@ class DeepSeekClient(BaseLLMClient):
                 model=self.model,
                 usage=usage,
                 latency=latency,
-                success=True,
+                success=success,
+                error=None if success else "empty response",
             )
             
         except Exception as e:
@@ -145,22 +148,28 @@ class DeepSeekClient(BaseLLMClient):
             生成的文本片段
         """
         config = get_config()
-        temperature = config.llm_temperature
-        max_tokens = config.llm_max_tokens
+        temperature = config.llm_temperature if temperature is None else temperature
+        max_tokens = config.llm_max_tokens if max_tokens is None else max_tokens
         
         try:
-            response = self._client.chat.completions.create(
+            request_kwargs = dict(kwargs)
+            request_kwargs["stream"] = True
+            stream = self._client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_dict() for m in messages],
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra_body={"enable_thinking": False},
-                **kwargs,
+                **request_kwargs,
             )
             
             for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                choices = getattr(chunk, "choices", [])
+                if not choices:
+                    continue
+                content = getattr(choices[0].delta, "content", None)
+                if content:
+                    yield content
                     
         except Exception as e:
             logger.error(f"LLM 流式生成失败: {e}")

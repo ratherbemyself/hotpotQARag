@@ -5,6 +5,7 @@
 """
 
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -14,6 +15,14 @@ from src.utils.logger import get_logger
 from src.retrievers.base_retriever import SearchResult
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class RerankSearchResult:
+    doc_id: str
+    content: str
+    score: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 # 尝试导入相关库
 try:
@@ -227,6 +236,12 @@ class Reranker:
             "use_fp16": self.use_fp16,
             "device": self.device,
         }
+
+
+class BGEReranker(Reranker):
+    """Backward-compatible BGE reranker name used by experiment scripts."""
+
+    pass
 
 
 class LLMBasedReranker:

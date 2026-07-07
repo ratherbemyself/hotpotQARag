@@ -29,7 +29,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HOTPOT_DIR = PROJECT_ROOT / "data" / "hotpotqa"
 
 
@@ -43,7 +43,7 @@ class RetrievalConfig:
     sentence_store_path: Path = DEFAULT_HOTPOT_DIR / "vector_stores" / "single_sentence"
     output_dir: Path = PROJECT_ROOT / "new_experiments" / "results"
 
-    sample_size: int = 5
+    sample_size: int = 10
     random_seed: int = 42
     k1: int = 10
     k2: int = 20
@@ -58,10 +58,10 @@ class RetrievalConfig:
 
     run_generation: bool = True
     run_judge: bool = True
-    use_api_reranker: bool = True
+    use_api_reranker: bool = False
     require_neo4j: bool = True
     
-    max_workers: int = 4
+    max_workers: int = 1
     checkpoint_interval: int = 10
     
     retrieval_cache_dir: str = ""
@@ -256,7 +256,7 @@ def compute_retrieval_metrics(
     """计算标题级别的Recall、Precision、MRR、NDCG和MAP。"""
 
     relevant = set(relevant_titles)
-    retrieved = [title for title in retrieved_titles if title]
+    retrieved = list(dict.fromkeys(title for title in retrieved_titles if title))
     if not relevant:
         return ExperimentMetrics(avg_len=avg_context_len, time_ms=latency_ms, expanded_nodes=expanded_nodes, storage_mb=storage_mb)
 
@@ -283,6 +283,79 @@ def compute_retrieval_metrics(
             running_hits += 1
             precisions.append(running_hits / idx)
     map_score = sum(precisions) / len(relevant) if relevant else 0.0
+
+    return ExperimentMetrics(
+        recall=recall,
+        precision=precision,
+        mrr=mrr,
+        ndcg=ndcg,
+        map_score=map_score,
+        avg_len=avg_context_len,
+        time_ms=latency_ms,
+        expanded_nodes=expanded_nodes,
+        storage_mb=storage_mb,
+    )
+
+
+def compute_support_fact_metrics(
+    retrieved_units: Sequence[EvidenceUnit],
+    relevant_facts: Set[Tuple[str, str]],
+    avg_context_len: float,
+    latency_ms: float,
+    expanded_nodes: float = 0.0,
+    storage_mb: Optional[float] = None,
+) -> ExperimentMetrics:
+    relevant = {(str(title), str(sent_id)) for title, sent_id in relevant_facts if str(title)}
+    if not relevant:
+        return compute_retrieval_metrics(
+            retrieved_titles=[unit.title for unit in retrieved_units],
+            relevant_titles=set(),
+            avg_context_len=avg_context_len,
+            latency_ms=latency_ms,
+            expanded_nodes=expanded_nodes,
+            storage_mb=storage_mb,
+        )
+
+    seen_units: Set[Tuple[str, str, str]] = set()
+    seen_facts: Set[Tuple[str, str]] = set()
+    unit_gains: List[int] = []
+    for unit in retrieved_units:
+        unit_key = (unit.title, unit.sentence_id, unit.content)
+        if unit_key in seen_units:
+            continue
+        seen_units.add(unit_key)
+
+        if unit.is_sentence_level and unit.sentence_id:
+            covered = {(unit.title, str(unit.sentence_id))} & relevant
+        else:
+            covered = {fact for fact in relevant if fact[0] == unit.title}
+        new_facts = covered - seen_facts
+        unit_gains.append(len(new_facts))
+        seen_facts.update(new_facts)
+
+    hit_count = len(seen_facts)
+    retrieved_count = len(unit_gains)
+    recall = hit_count / len(relevant)
+    precision = min(1.0, hit_count / retrieved_count) if retrieved_count else 0.0
+
+    mrr = 0.0
+    for idx, gain in enumerate(unit_gains, start=1):
+        if gain:
+            mrr = 1.0 / idx
+            break
+
+    dcg = sum(gain / math.log2(idx + 2) for idx, gain in enumerate(unit_gains))
+    ideal_gains = [1] * min(len(relevant), retrieved_count)
+    ideal_dcg = sum(gain / math.log2(idx + 2) for idx, gain in enumerate(ideal_gains))
+    ndcg = min(1.0, dcg / ideal_dcg) if ideal_dcg else 0.0
+
+    precisions = []
+    running_hits = 0
+    for idx, gain in enumerate(unit_gains, start=1):
+        if gain:
+            running_hits += gain
+            precisions.extend([running_hits / idx] * gain)
+    map_score = min(1.0, sum(precisions) / len(relevant)) if relevant else 0.0
 
     return ExperimentMetrics(
         recall=recall,
@@ -364,6 +437,9 @@ class PaperExperimentRunner:
         
         self._rerank_semaphore = threading.Semaphore(5)
         self._rerank_cache: Dict[str, List[EvidenceUnit]] = {}
+        self._graph_unit_cache: Dict[str, List[EvidenceUnit]] = {}
+        self._graph_retrieve_cache: Dict[str, List[EvidenceUnit]] = {}
+        self._graph_embedding_cache: Dict[str, np.ndarray] = {}
 
     # ------------------------------------------------------------------
     # 资源加载
@@ -378,6 +454,12 @@ class PaperExperimentRunner:
         self._load_optional_clients()
 
     def _load_documents(self) -> None:
+        if self.config.require_neo4j:
+            self.documents = []
+            self.title_to_content = {}
+            logger.info("Neo4j-required run: online evidence will be read from Neo4j, not JSON documents")
+            return
+
         with open(self.config.documents_path, "r", encoding="utf-8") as f:
             self.documents = json.load(f)
         self.title_to_content = {
@@ -431,19 +513,22 @@ class PaperExperimentRunner:
 
             self.llm_client = DeepSeekClient()
 
-        if self.config.use_api_reranker:
-            try:
-                from src.retrievers.reranker import create_reranker
+        try:
+            from src.retrievers.reranker import create_reranker
 
-                self.reranker = create_reranker(mode="api")
-            except Exception as exc:
-                logger.warning("API reranker unavailable; using lexical reranker: %s", exc)
-                self.reranker = None
+            mode = "api" if self.config.use_api_reranker else "local"
+            self.reranker = create_reranker(mode=mode)
+        except Exception as exc:
+            logger.warning("Reranker unavailable; using lexical rerank: %s", exc)
+            self.reranker = None
 
     # ------------------------------------------------------------------
     # 核心检索原语
     # ------------------------------------------------------------------
     def vector_retrieve(self, query: str, store_name: str = "sentence", top_k: Optional[int] = None) -> List[EvidenceUnit]:
+        if self.config.require_neo4j and self.graph_store is not None:
+            return self.graph_semantic_retrieve(query, store_name, top_k or self.config.k1)
+
         store = self.sentence_store if store_name == "sentence" else self.paragraph_store
         if store is None or self.embedding_client is None:
             return []
@@ -471,6 +556,122 @@ class PaperExperimentRunner:
                     metadata=dict(result.metadata.extra),
                 )
             )
+        return units
+
+    def graph_semantic_retrieve(self, query: str, store_name: str = "sentence", top_k: Optional[int] = None) -> List[EvidenceUnit]:
+        if self.graph_store is None or self.embedding_client is None:
+            return []
+
+        limit = top_k or self.config.k1
+        cache_key = f"{store_name}::{query}::{limit}"
+        if cache_key in self._graph_retrieve_cache:
+            return self._graph_retrieve_cache[cache_key]
+
+        candidates = self.load_graph_evidence_units(store_name)
+        if not candidates:
+            return []
+
+        candidate_embeddings = self.load_graph_evidence_embeddings(store_name)
+        qv = self.embedding_client.embed(query)
+        if len(qv.shape) == 2:
+            qv = qv[0]
+        scores = np.dot(candidate_embeddings, qv)
+        scored: List[Tuple[float, EvidenceUnit]] = []
+        for score, unit in zip(scores, candidates):
+            scored.append(
+                (
+                    float(score),
+                    EvidenceUnit(
+                        id=unit.id,
+                        title=unit.title,
+                        content=unit.content,
+                        score=float(score),
+                        source=f"graph_semantic_{store_name}",
+                        granularity=unit.granularity,
+                        is_sentence_level=unit.is_sentence_level,
+                        sentence_id=unit.sentence_id,
+                        metadata={**unit.metadata, "section_source": "neo4j"},
+                    ),
+                )
+            )
+        scored.sort(key=lambda item: item[0], reverse=True)
+        result = [unit for _, unit in scored[:limit]]
+        self._graph_retrieve_cache[cache_key] = result
+        return result
+
+    def load_graph_evidence_embeddings(self, store_name: str) -> np.ndarray:
+        if store_name in self._graph_embedding_cache:
+            return self._graph_embedding_cache[store_name]
+        if self.embedding_client is None:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        units = self.load_graph_evidence_units(store_name)
+        texts = [f"{unit.title}\n{unit.content}" for unit in units]
+        embeddings = self.embedding_client.embed(texts) if texts else np.zeros((0, self.embedding_client.dimension), dtype=np.float32)
+        self._graph_embedding_cache[store_name] = embeddings
+        return embeddings
+
+    def load_graph_evidence_units(self, store_name: str) -> List[EvidenceUnit]:
+        if store_name in self._graph_unit_cache:
+            return self._graph_unit_cache[store_name]
+        if self.graph_store is None:
+            return []
+
+        if store_name == "sentence":
+            cypher = """
+            MATCH (sec:Section)-[:HAS_PARAGRAPH]->(p:Paragraph)-[:HAS_SENTENCE]->(sent:Sentence)
+            RETURN sent.id AS id,
+                   sec.title AS title,
+                   sent.text AS content,
+                   sent.sent_id AS sent_id,
+                   p.id AS paragraph_id
+            ORDER BY sec.title, sent.position
+            """
+            rows = self.graph_store.query(cypher)
+            units = [
+                EvidenceUnit(
+                    id=str(row.get("id") or f"sentence::{row.get('title')}::{row.get('sent_id')}"),
+                    title=str(row.get("title") or ""),
+                    content=str(row.get("content") or ""),
+                    score=0.0,
+                    source="graph_semantic_sentence",
+                    granularity="sentence",
+                    is_sentence_level=True,
+                    sentence_id=str(row.get("sent_id") if row.get("sent_id") is not None else ""),
+                    metadata={"paragraph_id": str(row.get("paragraph_id") or ""), "section_source": "neo4j"},
+                )
+                for row in rows
+                if row.get("title") and row.get("content")
+            ]
+        else:
+            cypher = """
+            MATCH (sec:Section)-[:HAS_PARAGRAPH]->(p:Paragraph)
+            RETURN p.id AS id,
+                   sec.title AS title,
+                   p.text AS content,
+                   p.position AS position
+            ORDER BY sec.title, p.position
+            """
+            rows = self.graph_store.query(cypher)
+            units = [
+                EvidenceUnit(
+                    id=str(row.get("id") or f"paragraph::{row.get('title')}"),
+                    title=str(row.get("title") or ""),
+                    content=str(row.get("content") or ""),
+                    score=0.0,
+                    source="graph_semantic_paragraph",
+                    granularity="paragraph",
+                    metadata={
+                        "paragraph_id": str(row.get("id") or ""),
+                        "position": row.get("position"),
+                        "section_source": "neo4j",
+                    },
+                )
+                for row in rows
+                if row.get("title") and row.get("content")
+            ]
+
+        self._graph_unit_cache[store_name] = units
         return units
 
     def keyword_retrieve(self, query: str, top_k: Optional[int] = None) -> List[EvidenceUnit]:
@@ -556,24 +757,79 @@ class PaperExperimentRunner:
         return result
 
     def parent_map(self, units: Sequence[EvidenceUnit]) -> List[EvidenceUnit]:
-        mapped = []
+        mapped: Dict[Tuple[str, str, str], EvidenceUnit] = {}
         for unit in units:
-            full = self.title_to_content.get(unit.title)
+            graph_parent = self.fetch_parent_from_graph(unit.title)
+            if graph_parent:
+                full = graph_parent.get("content")
+            elif self.config.require_neo4j:
+                full = ""
+            else:
+                full = self.title_to_content.get(unit.title)
             if full and (unit.is_sentence_level or len(unit.content) < len(full)):
-                mapped.append(
-                    EvidenceUnit(
+                key = ("parent", unit.title, str(graph_parent.get("paragraph_id") if graph_parent else unit.title))
+                if key not in mapped:
+                    mapped[key] = EvidenceUnit(
                         id=f"parent::{unit.title}",
                         title=unit.title,
                         content=full,
                         score=unit.score,
                         source=f"{unit.source}+parent",
                         granularity="paragraph",
-                        metadata={"parent_of": unit.id},
+                        metadata={
+                            "parent_of": unit.id,
+                            "paragraph_id": graph_parent.get("paragraph_id") if graph_parent else "",
+                            "section_source": "neo4j" if graph_parent else "json_fallback",
+                            "trigger_unit_ids": [unit.id],
+                            "trigger_sentence_ids": [unit.sentence_id] if unit.sentence_id else [],
+                        },
                     )
-                )
+                else:
+                    parent = mapped[key]
+                    parent.score = max(parent.score, unit.score)
+                    parent.metadata.setdefault("trigger_unit_ids", []).append(unit.id)
+                    if unit.sentence_id:
+                        parent.metadata.setdefault("trigger_sentence_ids", []).append(unit.sentence_id)
             else:
-                mapped.append(unit)
-        return unique_by_title(mapped)
+                mapped[("unit", unit.title, unit.content)] = unit
+        return list(mapped.values())
+
+    def parent_context_pool(self, units: Sequence[EvidenceUnit]) -> List[EvidenceUnit]:
+        parents = [
+            unit
+            for unit in self.parent_map(units)
+            if unit.metadata.get("trigger_unit_ids") and unit.granularity in {"paragraph", "section"}
+        ]
+        return list(units) + parents
+
+    def fetch_parent_from_graph(self, title: str) -> Optional[Dict[str, Any]]:
+        if self.graph_store is None or not title:
+            return None
+
+        cypher = """
+        MATCH (s:Section {title: $title})
+        OPTIONAL MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
+        RETURN s.title AS title,
+               coalesce(p.text, s.sentence_total) AS content,
+               p.id AS paragraph_id
+        ORDER BY p.position
+        LIMIT 1
+        """
+        try:
+            rows = self.graph_store.query(cypher, {"title": title})
+        except Exception as exc:
+            logger.warning("Parent lookup from graph failed for %s: %s", title, exc)
+            return None
+        if not rows:
+            return None
+        content = str(rows[0].get("content") or "")
+        if not content:
+            return None
+        return {
+            "title": str(rows[0].get("title") or title),
+            "content": content,
+            "paragraph_id": str(rows[0].get("paragraph_id") or ""),
+        }
 
     def graph_expand(self, seed_titles: Sequence[str], hops: int = 1, limit_per_seed: Optional[int] = None) -> List[EvidenceUnit]:
         if self.graph_store is None:
@@ -586,22 +842,21 @@ class PaperExperimentRunner:
         seen = set(seed_titles)
 
         for title in seed_titles:
-            safe_title = title.replace('"', '\\"')
-            cypher = (
-                'MATCH (start:Section {title: "' + safe_title + '"})\n'
-                'MATCH (start)-[:SEMANTIC_LINKS]-(first)\n'
-                f'MATCH p = (first)-[r*0..{hops}]-(last)\n'
-                'MATCH (last)-[:SEMANTIC_LINKS]-(n:Section)\n'
-                'WHERE n <> start\n'
-                "  AND ALL(rel IN r WHERE type(rel) <> 'SEPARATES')\n"
-                f"  AND ALL(x IN nodes(p) WHERE COUNT {{ (x)--() }} <= {max_degree})\n"
-                "RETURN DISTINCT\n"
-                "    n.title AS title,\n"
-                "    n.sentence_total AS content\n"
-                f"LIMIT {limit}"
-            )
+            cypher = f"""
+            MATCH (start:Section {{title: $title}})
+            MATCH (start)-[:SEMANTIC_LINKS]->(first:Entity)
+            MATCH p = (first)-[:RELATED*0..{hops}]-(last:Entity)
+            MATCH (last)<-[:SEMANTIC_LINKS]-(n:Section)
+            WHERE n <> start
+              AND ALL(x IN nodes(p) WHERE COUNT {{ (x)--() }} <= $max_degree)
+            RETURN DISTINCT n.title AS title, n.sentence_total AS content
+            LIMIT $limit
+            """
             try:
-                rows = self.graph_store.query(cypher)
+                rows = self.graph_store.query(
+                    cypher,
+                    {"title": title, "max_degree": max_degree, "limit": limit},
+                )
             except Exception as exc:
                 logger.warning("Graph expansion failed for %s: %s", title, exc)
                 continue
@@ -634,7 +889,13 @@ class PaperExperimentRunner:
         query_terms = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", query)) if query else set()
         
         for title in seed_titles:
-            content = self.title_to_content.get(title, "")
+            graph_parent = self.fetch_parent_from_graph(title)
+            if graph_parent:
+                content = graph_parent.get("content", "")
+            elif self.config.require_neo4j:
+                content = ""
+            else:
+                content = self.title_to_content.get(title, "")
             if not content:
                 continue
             
@@ -674,29 +935,53 @@ class PaperExperimentRunner:
         max_units = max_units or self.config.max_context_units
         total_tokens = 0
 
-        candidates = unique_by_title(units, keep_content_distinct=False)
+        candidates = unique_by_title(units, keep_content_distinct=True)
         query_terms = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", query))
 
-        scored = []
-        for unit in candidates:
+        remaining = []
+        for index, unit in enumerate(candidates):
             terms = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", f"{unit.title} {unit.content}"))
-            relevance = len(query_terms & terms) / max(len(query_terms), 1)
-            novelty = 1.0 if not selected_terms else len(terms - selected_terms) / max(len(terms), 1)
-            cost = unit.token_count / max(budget, 1)
-            score = 0.45 * unit.score + 0.30 * relevance + 0.20 * novelty - 0.15 * cost
-            scored.append((score, unit, terms))
+            evidence_terms = terms & query_terms if query_terms else terms
+            remaining.append((index, unit, evidence_terms))
 
-        scored.sort(key=lambda item: item[0], reverse=True)
-        for _, unit, terms in scored:
+        while remaining and len(selected) < max_units:
+            scored = []
+            for index, unit, evidence_terms in remaining:
+                relevance = len(evidence_terms) / max(len(query_terms), 1) if query_terms else 0.0
+                if not selected_terms:
+                    completion = 1.0 if evidence_terms else 0.0
+                else:
+                    completion = len(evidence_terms - selected_terms) / max(len(evidence_terms), 1) if evidence_terms else 0.0
+                cost = unit.token_count / max(budget, 1)
+                value = 0.55 * relevance + 0.40 * completion - 0.15 * cost
+                scored.append((value, unit.score, -index, index, unit, evidence_terms))
+
+            scored.sort(reverse=True)
+            _, _, _, selected_index, unit, evidence_terms = scored[0]
             if len(selected) >= max_units:
                 break
             if total_tokens + unit.token_count > budget and selected:
+                remaining = [item for item in remaining if item[0] != selected_index]
                 continue
             selected.append(unit)
-            selected_terms.update(terms)
+            selected_terms.update(evidence_terms)
             total_tokens += unit.token_count
+            remaining = [item for item in remaining if item[0] != selected_index]
 
-        return selected
+        return self.assemble_context(selected)
+
+    def assemble_context(self, units: Sequence[EvidenceUnit]) -> List[EvidenceUnit]:
+        def priority(unit: EvidenceUnit) -> Tuple[int, float]:
+            source = unit.source.lower()
+            if unit.granularity == "summary" or source == "summary":
+                group = 2
+            elif unit.id.startswith("graph::") or (source.startswith("graph_") and "semantic" not in source):
+                group = 1
+            else:
+                group = 0
+            return (group, -unit.score)
+
+        return sorted(units, key=priority)
 
     # ------------------------------------------------------------------
     # 方法实现
@@ -772,19 +1057,24 @@ class PaperExperimentRunner:
         if route == "fine_grained":
             selected = unique_by_title(reranked)[: self.config.k3]
         elif route == "local_parent" and enable_parent:
-            selected = self.parent_map(reranked)
+            selected = self.select_with_budget(query, self.parent_context_pool(reranked))
         else:
-            seeds = self.parent_map(reranked) if enable_parent else reranked
+            parent_units = [
+                unit
+                for unit in (self.parent_map(reranked) if enable_parent else [])
+                if unit.metadata.get("trigger_unit_ids")
+            ]
+            summary_seed_units = parent_units or list(reranked)
             hops = forced_hops or self._dynamic_hops(route_detail)
             if enable_graph_expansion:
-                expanded = self.graph_expand([u.title for u in seeds], hops=hops)
+                expanded = self.graph_expand([u.title for u in reranked], hops=hops)
             
-            all_candidates = list(seeds) + expanded
-            current_tokens = sum(estimate_tokens(u.content) for u in all_candidates)
+            all_candidates = list(reranked) + parent_units + expanded
+            current_tokens = sum(estimate_tokens(u.content) for u in parent_units + expanded)
             context_deficit = self.config.context_budget * 0.5 - current_tokens
             
             if enable_summary and context_deficit > 0:
-                summaries = self.add_summary_evidence([u.title for u in seeds], query)
+                summaries = self.add_summary_evidence([u.title for u in summary_seed_units], query)
             else:
                 summaries = []
             
@@ -796,16 +1086,22 @@ class PaperExperimentRunner:
 
     def retrieve_fixed_graph(self, query: str, hops: int) -> MethodResult:
         start = time.perf_counter()
-        seeds = self.rerank_units(query, self.vector_retrieve(query, "sentence", self.config.k1), self.config.k3)
+        initial = self.vector_retrieve(query, "sentence", self.config.k1) + self.keyword_retrieve(query, self.config.k2)
+        initial = unique_by_title(initial, keep_content_distinct=True)
+        seeds = self.rerank_units(query, initial, self.config.k3)
         expanded = self.graph_expand([u.title for u in seeds], hops=hops)
-        units = self.select_with_budget(query, self.parent_map(seeds) + expanded)
+        units = self.select_with_budget(query, self.parent_context_pool(seeds) + expanded)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route=f"fixed_{hops}hop"))
 
     def choose_adaptive_route(self, query: str, candidates: Sequence[EvidenceUnit]) -> Tuple[str, Dict[str, Any]]:
         complexity = self.complexity_scorer.compute(query)
         evidence_status = self.evaluate_evidence_status(candidates, query)
 
-        if complexity.score >= self.config.complexity_threshold or evidence_status.fragmentation >= self.config.fragmentation_threshold:
+        if (
+            complexity.multi_hop_indicator
+            or complexity.score >= self.config.complexity_threshold
+            or evidence_status.fragmentation >= self.config.fragmentation_threshold
+        ):
             route = "graph_expansion"
         elif evidence_status.score >= self.config.parent_threshold and evidence_status.short_sentence_ratio < 0.4:
             route = "fine_grained"
@@ -856,7 +1152,7 @@ class PaperExperimentRunner:
 
     def _dynamic_hops(self, route_detail: Dict[str, Any]) -> int:
         high_complexity = route_detail.get("complexity_score", 0.0) >= self.config.complexity_threshold
-        weak_complement = route_detail.get("complementarity", 0.0) < 0.55
+        weak_complement = route_detail.get("complementarity", 0.0) < self.config.complexity_threshold
         return self.config.hmax if high_complexity and weak_complement else 1
 
     def _stats(self, start: float, units: Sequence[EvidenceUnit], expanded_nodes: int, route: str) -> Dict[str, Any]:
@@ -866,6 +1162,69 @@ class PaperExperimentRunner:
             "expanded_nodes": expanded_nodes,
             "route": route,
         }
+
+    def _llm_retry_count(self) -> int:
+        if self.llm_client is None:
+            return 1
+        try:
+            return max(1, int(getattr(self.llm_client, "max_retries", 3) or 1))
+        except (TypeError, ValueError):
+            return 3
+
+    def _llm_retry_delay(self) -> float:
+        if self.llm_client is None:
+            return 0.0
+        try:
+            return max(0.0, float(getattr(self.llm_client, "retry_delay", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _escalated_max_tokens(max_tokens: int, attempt: int) -> int:
+        try:
+            requested = max(1, int(max_tokens))
+        except (TypeError, ValueError):
+            requested = 256
+        try:
+            from src.utils.config import get_config
+
+            cap = max(requested, int(get_config().llm_max_tokens))
+        except Exception:
+            cap = max(requested, 4096)
+        return min(cap, requested * (2 ** attempt))
+
+    def _generate_llm_response(
+        self,
+        messages: List[Any],
+        temperature: float,
+        max_tokens: int,
+    ):
+        from src.llms.base_client import LLMResponse
+
+        last_response = None
+        attempts = self._llm_retry_count()
+        retry_delay = self._llm_retry_delay()
+        for attempt in range(attempts):
+            effective_max_tokens = self._escalated_max_tokens(max_tokens, attempt)
+            response = self.llm_client.generate(
+                messages,
+                temperature=temperature,
+                max_tokens=effective_max_tokens,
+            )
+            last_response = response
+            if response.success and response.content and response.content.strip():
+                return response
+
+            logger.warning(
+                "LLM returned empty/failed response (attempt %d/%d): %s",
+                attempt + 1,
+                attempts,
+                getattr(response, "error", None) or "empty content",
+            )
+            if attempt < attempts - 1 and retry_delay > 0:
+                time.sleep(retry_delay * (attempt + 1))
+
+        return last_response or LLMResponse(content="", success=False, error="no llm response")
 
     # ------------------------------------------------------------------
     # 生成和判断
@@ -884,7 +1243,11 @@ class PaperExperimentRunner:
         )
         from src.llms.base_client import Message
 
-        response = self.llm_client.generate([Message(role="user", content=prompt)], temperature=0.0, max_tokens=256)
+        response = self._generate_llm_response(
+            [Message(role="user", content=prompt)],
+            temperature=0.0,
+            max_tokens=256,
+        )
         return response.content.strip() if response.success else ""
 
     def judge_answer(
@@ -917,10 +1280,31 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
 """
         from src.llms.base_client import Message
 
-        response = self.llm_client.generate([Message(role="user", content=prompt)], temperature=0.0, max_tokens=180)
-        if not response.success:
-            return base
-        parsed = self._parse_json_object(response.content)
+        messages = [Message(role="user", content=prompt)]
+        parsed = None
+        attempts = self._llm_retry_count()
+        retry_delay = self._llm_retry_delay()
+        for attempt in range(attempts):
+            response = self.llm_client.generate(
+                messages,
+                temperature=0.0,
+                max_tokens=self._escalated_max_tokens(512, attempt),
+                response_format={"type": "json_object"},
+            )
+            if response.success and response.content and response.content.strip():
+                parsed = self._parse_json_object(response.content)
+                if parsed:
+                    break
+
+            logger.warning(
+                "LLM judge returned failed/blank/unparsable response (attempt %d/%d): %s",
+                attempt + 1,
+                attempts,
+                getattr(response, "error", None) or "unparsable JSON",
+            )
+            if attempt < attempts - 1 and retry_delay > 0:
+                time.sleep(retry_delay * (attempt + 1))
+
         if not parsed:
             return base
         for key in base:
@@ -1055,11 +1439,12 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
             """阶段2：生成和评估（不受限制）"""
             question = str(sample.get("question", ""))
             ground_truth = str(sample.get("answer", ""))
+            relevant_facts = self.get_relevant_facts(sample)
 
             retrieved_titles = [u.title for u in method_result.units]
-            metrics = compute_retrieval_metrics(
-                retrieved_titles=retrieved_titles,
-                relevant_titles=relevant_titles,
+            metrics = compute_support_fact_metrics(
+                retrieved_units=method_result.units,
+                relevant_facts=relevant_facts,
                 avg_context_len=method_result.stats.get("avg_len", context_len(method_result.units)),
                 latency_ms=method_result.stats.get("time_ms", 0.0),
                 expanded_nodes=method_result.stats.get("expanded_nodes", 0),
@@ -1146,10 +1531,11 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
             for method_name, sample, method_result, relevant_titles in retrieval_results:
                 question = str(sample.get("question", ""))
                 ground_truth = str(sample.get("answer", ""))
+                relevant_facts = self.get_relevant_facts(sample)
                 retrieved_titles = [u.title for u in method_result.units]
-                metrics = compute_retrieval_metrics(
-                    retrieved_titles=retrieved_titles,
-                    relevant_titles=relevant_titles,
+                metrics = compute_support_fact_metrics(
+                    retrieved_units=method_result.units,
+                    relevant_facts=relevant_facts,
                     avg_context_len=method_result.stats.get("avg_len", context_len(method_result.units)),
                     latency_ms=method_result.stats.get("time_ms", 0.0),
                     expanded_nodes=method_result.stats.get("expanded_nodes", 0),
@@ -1306,6 +1692,23 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
         if isinstance(titles, np.ndarray):
             titles = titles.tolist()
         return set(str(t) for t in titles)
+
+    @staticmethod
+    def get_relevant_facts(sample: pd.Series) -> Set[Tuple[str, str]]:
+        supporting = sample.get("supporting_facts", {})
+        if not hasattr(supporting, "get"):
+            return set()
+        titles = supporting.get("title", [])
+        sent_ids = supporting.get("sent_id", [])
+        if isinstance(titles, np.ndarray):
+            titles = titles.tolist()
+        if isinstance(sent_ids, np.ndarray):
+            sent_ids = sent_ids.tolist()
+        return {
+            (str(title), str(sent_id))
+            for title, sent_id in zip(titles, sent_ids)
+            if str(title)
+        }
 
     @staticmethod
     def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:

@@ -40,6 +40,8 @@ env/
 
 # Data
 data/
+models/
+new_experiments/results/
 *.db
 *.sqlite
 *.sqlite3

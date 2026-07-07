@@ -4,11 +4,12 @@
 使用 pydantic-settings 实现配置管理，支持从环境变量加载配置。
 """
 
+import os
 from pathlib import Path
 from typing import Optional, Literal
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 项目根目录
@@ -35,12 +36,24 @@ class Config(BaseSettings):
     
     # ==================== API Keys ====================
     openai_api_key: Optional[str] = Field(
-        default=None,
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY"),
         description="OpenAI API Key"
     )
     openai_api_base: Optional[str] = Field(
-        default=None,
+        default_factory=lambda: os.getenv("DEEPSEEK_BASE_URL"),
         description="OpenAI API Base URL"
+    )
+    deepseek_api_key: Optional[str] = Field(
+        default=None,
+        description="DeepSeek API Key"
+    )
+    deepseek_base_url: Optional[str] = Field(
+        default=None,
+        description="DeepSeek API Base URL"
+    )
+    deepseek_model: Optional[str] = Field(
+        default=None,
+        description="DeepSeek model name"
     )
 
     anthropic_api_key: Optional[str] = Field(
@@ -167,7 +180,7 @@ class Config(BaseSettings):
     
     # ==================== LLM 参数 ====================
     llm_model: str = Field(
-        default="gpt-3.5-turbo",
+        default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         description="LLM 模型名称"
     )
     llm_temperature: float = Field(
@@ -184,11 +197,13 @@ class Config(BaseSettings):
     
     # ==================== 嵌入模型参数 ====================
     embedding_mode: str = Field(
-        default="auto",
+        default="local",
         description="嵌入模式: api, local, bge, auto"
     )
     embedding_model: str = Field(
-        default="BAAI/bge-large-zh-v1.5",
+        default_factory=lambda: str(PROJECT_ROOT / "models" / "BAAI" / "bge-m3")
+        if (PROJECT_ROOT / "models" / "BAAI" / "bge-m3").exists()
+        else "BAAI/bge-m3",
         description="嵌入模型名称"
     )
     embedding_device: Optional[str] = Field(
@@ -202,7 +217,7 @@ class Config(BaseSettings):
     
     # ==================== 重排序配置 ====================
     rerank_model: Optional[str] = Field(
-        default="BAAI/bge-reranker-large",
+        default="BAAI/bge-reranker-base",
         description="重排序模型名称"
     )
     rerank_api_key: Optional[str] = Field(
@@ -217,6 +232,25 @@ class Config(BaseSettings):
         default="local",
         description="重排序模式: local (本地模型), api (API调用)"
     )
+
+    @model_validator(mode="after")
+    def prefer_deepseek_env(self) -> "Config":
+        """Use DeepSeek-specific variables when present.
+
+        Some environments keep OPENAI_* variables around. This project uses a
+        DeepSeek OpenAI-compatible endpoint for generation/judging, so the
+        DEEPSEEK_* variables are authoritative when they are set.
+        """
+        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY") or self.deepseek_api_key
+        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL") or self.deepseek_base_url
+        deepseek_model = os.getenv("DEEPSEEK_MODEL") or self.deepseek_model
+        if deepseek_api_key:
+            self.openai_api_key = deepseek_api_key
+        if deepseek_base_url:
+            self.openai_api_base = deepseek_base_url
+        if deepseek_model:
+            self.llm_model = deepseek_model
+        return self
     
     # ==================== Agent 参数 ====================
     agent_max_iterations: int = Field(

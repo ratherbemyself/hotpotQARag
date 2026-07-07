@@ -21,6 +21,7 @@ def build_config(args: argparse.Namespace) -> RetrievalConfig:
         run_judge=not args.no_judge,
         use_api_reranker=args.api_reranker,
         require_neo4j=not args.allow_no_neo4j,
+        complexity_stratified_sampling=not args.no_complexity_stratified_sampling,
     )
 
 
@@ -32,6 +33,7 @@ def main() -> int:
     parser.add_argument("--no-judge", action="store_true")
     parser.add_argument("--api-reranker", action="store_true")
     parser.add_argument("--allow-no-neo4j", action="store_true")
+    parser.add_argument("--no-complexity-stratified-sampling", action="store_true")
     parser.add_argument("--exp", type=str, default="all", help="Only 'all' is supported by the paper flow")
     args = parser.parse_args()
 

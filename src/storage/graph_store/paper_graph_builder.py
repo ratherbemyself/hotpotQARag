@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -14,9 +15,13 @@ def normalize_key(value: Any) -> str:
 
 
 def make_id(prefix: str, value: str) -> str:
-    key = normalize_key(value)
-    key = re.sub(r"[^a-z0-9]+", "_", key).strip("_")
-    return f"{prefix}::{key or 'unknown'}"
+    normalized = normalize_key(value)
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_") or "unknown"
+    plain_slug = re.sub(r"\s+", "_", normalized).strip("_")
+    if plain_slug == slug:
+        return f"{prefix}::{slug}"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}::{slug}::{digest}"
 
 
 def split_sentences(text: str) -> List[str]:
@@ -219,6 +224,46 @@ def prepare_paper_graph_rows(records: Sequence[Dict[str, Any]]) -> Dict[str, Lis
     }
 
 
+def _embedding_text(row: Dict[str, Any], content_field: str) -> str:
+    title = str(row.get("title") or "").strip()
+    content = str(row.get(content_field) or "").strip()
+    if title and content:
+        return f"{title}\n{content}"
+    return title or content
+
+
+def _embedding_vector_to_list(vector: Any) -> List[float]:
+    if hasattr(vector, "tolist"):
+        vector = vector.tolist()
+    return [float(value) for value in vector]
+
+
+def attach_paper_graph_embeddings(
+    rows: Dict[str, List[Dict[str, Any]]],
+    embedding_client: Any,
+    batch_size: int = 32,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Attach local embedding vectors to graph text nodes before Neo4j writes."""
+    batch_size = max(1, int(batch_size or 32))
+    targets: List[tuple[Dict[str, Any], str]] = []
+    for collection_name, content_field in (
+        ("sections", "sentence_total"),
+        ("paragraphs", "text"),
+        ("sentences", "text"),
+    ):
+        for row in rows.get(collection_name, []):
+            text = _embedding_text(row, content_field)
+            if text:
+                targets.append((row, text))
+
+    for start in range(0, len(targets), batch_size):
+        batch = targets[start : start + batch_size]
+        embeddings = embedding_client.embed([text for _, text in batch])
+        for (row, _), vector in zip(batch, embeddings):
+            row["embedding"] = _embedding_vector_to_list(vector)
+    return rows
+
+
 def chunked(items: Sequence[Dict[str, Any]], size: int) -> Iterable[Sequence[Dict[str, Any]]]:
     for start in range(0, len(items), size):
         yield items[start : start + size]
@@ -298,6 +343,9 @@ def load_paper_graph_batch(graph_store: Any, rows: Dict[str, List[Dict[str, Any]
             n.document_id = row.document_id,
             n.core_entities = row.core_entities,
             n.relation_summary = row.relation_summary
+        FOREACH (_ IN CASE WHEN row.embedding IS NULL THEN [] ELSE [1] END |
+            SET n.embedding = row.embedding
+        )
         """,
         {"rows": rows["sections"]},
     )
@@ -309,6 +357,9 @@ def load_paper_graph_batch(graph_store: Any, rows: Dict[str, List[Dict[str, Any]
             n.text = row.text,
             n.position = row.position,
             n.section_id = row.section_id
+        FOREACH (_ IN CASE WHEN row.embedding IS NULL THEN [] ELSE [1] END |
+            SET n.embedding = row.embedding
+        )
         """,
         {"rows": rows["paragraphs"]},
     )
@@ -322,6 +373,9 @@ def load_paper_graph_batch(graph_store: Any, rows: Dict[str, List[Dict[str, Any]
             n.position = row.position,
             n.paragraph_id = row.paragraph_id,
             n.section_id = row.section_id
+        FOREACH (_ IN CASE WHEN row.embedding IS NULL THEN [] ELSE [1] END |
+            SET n.embedding = row.embedding
+        )
         """,
         {"rows": rows["sentences"]},
     )
@@ -385,9 +439,19 @@ def load_paper_graph_batch(graph_store: Any, rows: Dict[str, List[Dict[str, Any]
     )
 
 
-def load_paper_graph(graph_store: Any, records: Sequence[Dict[str, Any]], batch_size: int = 500, clear: bool = True) -> None:
+def load_paper_graph(
+    graph_store: Any,
+    records: Sequence[Dict[str, Any]],
+    batch_size: int = 500,
+    clear: bool = True,
+    embedding_client: Any | None = None,
+    embedding_batch_size: int = 1024,
+) -> None:
     if clear:
         clear_paper_graph(graph_store, batch_size=batch_size)
     create_paper_graph_schema(graph_store)
     for batch in chunked(records, batch_size):
-        load_paper_graph_batch(graph_store, prepare_paper_graph_rows(batch))
+        rows = prepare_paper_graph_rows(batch)
+        if embedding_client is not None:
+            attach_paper_graph_embeddings(rows, embedding_client, batch_size=embedding_batch_size)
+        load_paper_graph_batch(graph_store, rows)

@@ -60,6 +60,7 @@ class RetrievalConfig:
     run_judge: bool = True
     use_api_reranker: bool = False
     require_neo4j: bool = True
+    complexity_stratified_sampling: bool = True
     
     max_workers: int = 1
     checkpoint_interval: int = 10
@@ -233,6 +234,86 @@ class QueryComplexityScorer:
 
     def _detect_multi_hop(self, query: str) -> bool:
         return any(re.search(pattern, query, re.IGNORECASE) for pattern in self.MULTI_HOP_PATTERNS)
+
+
+COMPLEXITY_LEVELS = ("low", "medium", "high")
+
+
+def complexity_level_for_score(score: float, complexity_threshold: float = 0.80) -> str:
+    if score < 0.45:
+        return "low"
+    if score < complexity_threshold:
+        return "medium"
+    return "high"
+
+
+def _balanced_complexity_targets(sample_size: int) -> Dict[str, int]:
+    sample_size = max(0, int(sample_size or 0))
+    base, remainder = divmod(sample_size, len(COMPLEXITY_LEVELS))
+    return {
+        level: base + (1 if idx < remainder else 0)
+        for idx, level in enumerate(COMPLEXITY_LEVELS)
+    }
+
+
+def _assign_ranked_complexity_levels(scored: pd.DataFrame) -> pd.DataFrame:
+    if scored.empty:
+        scored["_complexity_level"] = []
+        return scored
+
+    ranked = scored.sort_values(["_complexity_score", "id"], kind="mergesort").copy()
+    n = len(ranked)
+    base, remainder = divmod(n, len(COMPLEXITY_LEVELS))
+    labels: List[str] = []
+    for idx, level in enumerate(COMPLEXITY_LEVELS):
+        labels.extend([level] * (base + (1 if idx < remainder else 0)))
+    ranked["_complexity_level"] = labels[:n]
+    return ranked.sort_index()
+
+
+def sample_hotpotqa_by_complexity(
+    data: pd.DataFrame,
+    sample_size: int,
+    scorer: QueryComplexityScorer,
+    random_seed: int,
+    complexity_threshold: float = 0.80,
+) -> pd.DataFrame:
+    """Sample HotpotQA rows by low/medium/high query complexity."""
+    if not sample_size or sample_size >= len(data):
+        return data.reset_index(drop=True)
+
+    scored = data.copy()
+    scored["_complexity_score"] = [
+        scorer.compute(str(question)).score
+        for question in scored["question"]
+    ]
+    scored = _assign_ranked_complexity_levels(scored)
+
+    targets = _balanced_complexity_targets(sample_size)
+    selected_parts: List[pd.DataFrame] = []
+    selected_indexes: Set[Any] = set()
+    for offset, level in enumerate(COMPLEXITY_LEVELS):
+        target = targets[level]
+        bucket = scored[scored["_complexity_level"] == level]
+        if target <= 0 or bucket.empty:
+            continue
+        take = min(target, len(bucket))
+        part = bucket.sample(n=take, random_state=random_seed + offset)
+        selected_parts.append(part)
+        selected_indexes.update(part.index.tolist())
+
+    selected_count = sum(len(part) for part in selected_parts)
+    remaining = sample_size - selected_count
+    if remaining > 0:
+        rest = scored.drop(index=list(selected_indexes), errors="ignore")
+        if not rest.empty:
+            selected_parts.append(rest.sample(n=min(remaining, len(rest)), random_state=random_seed + 99))
+
+    if not selected_parts:
+        return scored.sample(n=sample_size, random_state=random_seed).reset_index(drop=True)
+
+    sampled = pd.concat(selected_parts, axis=0)
+    return sampled.sample(frac=1.0, random_state=random_seed + 123).reset_index(drop=True)
 
 
 def estimate_tokens(text: str) -> int:
@@ -472,7 +553,16 @@ class PaperExperimentRunner:
     def _load_test_data(self) -> None:
         data = pd.read_parquet(self.config.test_data_path)
         if self.config.sample_size and self.config.sample_size < len(data):
-            data = data.sample(n=self.config.sample_size, random_state=self.config.random_seed)
+            if self.config.complexity_stratified_sampling:
+                data = sample_hotpotqa_by_complexity(
+                    data,
+                    sample_size=self.config.sample_size,
+                    scorer=self.complexity_scorer,
+                    random_seed=self.config.random_seed,
+                    complexity_threshold=self.config.complexity_threshold,
+                )
+            else:
+                data = data.sample(n=self.config.sample_size, random_state=self.config.random_seed)
         self.test_data = data.reset_index(drop=True)
         logger.info("Loaded %s HotpotQA samples", len(self.test_data))
 
@@ -606,10 +696,50 @@ class PaperExperimentRunner:
             return np.zeros((0, 0), dtype=np.float32)
 
         units = self.load_graph_evidence_units(store_name)
-        texts = [f"{unit.title}\n{unit.content}" for unit in units]
-        embeddings = self.embedding_client.embed(texts) if texts else np.zeros((0, self.embedding_client.dimension), dtype=np.float32)
+        if not units:
+            embeddings = np.zeros((0, self.embedding_client.dimension), dtype=np.float32)
+            self._graph_embedding_cache[store_name] = embeddings
+            return embeddings
+
+        vectors_by_index: Dict[int, np.ndarray] = {}
+        missing_indexes: List[int] = []
+        missing_texts: List[str] = []
+        for idx, unit in enumerate(units):
+            stored_vector = self._stored_graph_embedding(unit)
+            if stored_vector is None:
+                missing_indexes.append(idx)
+                missing_texts.append(f"{unit.title}\n{unit.content}")
+            else:
+                vectors_by_index[idx] = stored_vector
+
+        if missing_texts:
+            encoded = self.embedding_client.embed(missing_texts)
+            for idx, vector in zip(missing_indexes, encoded):
+                vectors_by_index[idx] = np.asarray(vector, dtype=np.float32)
+
+        dimension = next((len(vector) for vector in vectors_by_index.values() if len(vector)), self.embedding_client.dimension)
+        embeddings = np.vstack(
+            [
+                vectors_by_index.get(idx, np.zeros(dimension, dtype=np.float32))
+                for idx in range(len(units))
+            ]
+        ).astype(np.float32)
         self._graph_embedding_cache[store_name] = embeddings
         return embeddings
+
+    @staticmethod
+    def _stored_graph_embedding(unit: EvidenceUnit) -> Optional[np.ndarray]:
+        vector = unit.metadata.get("graph_embedding")
+        if vector is None:
+            return None
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+        if not isinstance(vector, list) or not vector:
+            return None
+        try:
+            return np.asarray([float(value) for value in vector], dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
 
     def load_graph_evidence_units(self, store_name: str) -> List[EvidenceUnit]:
         if store_name in self._graph_unit_cache:
@@ -624,7 +754,8 @@ class PaperExperimentRunner:
                    sec.title AS title,
                    sent.text AS content,
                    sent.sent_id AS sent_id,
-                   p.id AS paragraph_id
+                   p.id AS paragraph_id,
+                   sent.embedding AS embedding
             ORDER BY sec.title, sent.position
             """
             rows = self.graph_store.query(cypher)
@@ -638,7 +769,11 @@ class PaperExperimentRunner:
                     granularity="sentence",
                     is_sentence_level=True,
                     sentence_id=str(row.get("sent_id") if row.get("sent_id") is not None else ""),
-                    metadata={"paragraph_id": str(row.get("paragraph_id") or ""), "section_source": "neo4j"},
+                    metadata={
+                        "paragraph_id": str(row.get("paragraph_id") or ""),
+                        "section_source": "neo4j",
+                        "graph_embedding": row.get("embedding"),
+                    },
                 )
                 for row in rows
                 if row.get("title") and row.get("content")
@@ -649,7 +784,8 @@ class PaperExperimentRunner:
             RETURN p.id AS id,
                    sec.title AS title,
                    p.text AS content,
-                   p.position AS position
+                   p.position AS position,
+                   p.embedding AS embedding
             ORDER BY sec.title, p.position
             """
             rows = self.graph_store.query(cypher)
@@ -665,6 +801,7 @@ class PaperExperimentRunner:
                         "paragraph_id": str(row.get("id") or ""),
                         "position": row.get("position"),
                         "section_source": "neo4j",
+                        "graph_embedding": row.get("embedding"),
                     },
                 )
                 for row in rows
@@ -1015,15 +1152,9 @@ class PaperExperimentRunner:
 
     def retrieve_macrag(self, query: str) -> MethodResult:
         start = time.perf_counter()
-        complexity = self.complexity_scorer.compute(query)
-        if complexity.score < 0.45:
-            units = self.vector_retrieve(query, "sentence", self.config.k1)[: self.config.k3]
-        elif complexity.score < self.config.complexity_threshold:
-            sent = self.vector_retrieve(query, "sentence", max(1, self.config.k1 // 2))
-            para = self.vector_retrieve(query, "paragraph", max(1, self.config.k1 // 2))
-            units = self.rerank_units(query, sent + para, self.config.k3)
-        else:
-            units = self.vector_retrieve(query, "paragraph", self.config.k1)[: self.config.k3]
+        sent = self.vector_retrieve(query, "sentence", self.config.k1)
+        para = self.vector_retrieve(query, "paragraph", max(1, self.config.k1 // 2))
+        units = self.rerank_units(query, sent + para, self.config.k3)
         units = self.select_with_budget(query, units, max_units=self.config.k3)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="macrag"))
 
@@ -1454,6 +1585,7 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
             semantic = self.judge_answer(question, ground_truth, answer, method_result.units)
 
             route_detail = method_result.stats.get("route_detail", {})
+            complexity_score = route_detail.get("complexity_score", self.complexity_scorer.compute(question).score)
             result = {
                 "id": sample.get("id"),
                 "question": question,
@@ -1467,7 +1599,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                 "retrieval_metrics": metrics,
                 "semantic_metrics": semantic,
                 "stats": method_result.stats,
-                "complexity_score": route_detail.get("complexity_score", self.complexity_scorer.compute(question).score),
+                "complexity_score": complexity_score,
+                "complexity_level": sample.get("_complexity_level", complexity_level_for_score(float(complexity_score), self.config.complexity_threshold)),
                 "route": method_result.stats.get("route", route_detail.get("route", "")),
             }
             
@@ -1541,6 +1674,7 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                     expanded_nodes=method_result.stats.get("expanded_nodes", 0),
                 )
                 route_detail = method_result.stats.get("route_detail", {})
+                complexity_score = route_detail.get("complexity_score", self.complexity_scorer.compute(question).score)
                 result = {
                     "id": sample.get("id"),
                     "question": question,
@@ -1554,7 +1688,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                     "retrieval_metrics": metrics,
                     "semantic_metrics": {},
                     "stats": method_result.stats,
-                    "complexity_score": route_detail.get("complexity_score", self.complexity_scorer.compute(question).score),
+                    "complexity_score": complexity_score,
+                    "complexity_level": sample.get("_complexity_level", complexity_level_for_score(float(complexity_score), self.config.complexity_threshold)),
                     "route": method_result.stats.get("route", route_detail.get("route", "")),
                 }
                 with rows_lock:
@@ -1631,12 +1766,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
         }
         for row in proposed_rows:
             score = float(row.get("complexity_score", 0.0))
-            if score < 0.45:
-                buckets["low"].append(row)
-            elif score < self.config.complexity_threshold:
-                buckets["medium"].append(row)
-            else:
-                buckets["high"].append(row)
+            level = str(row.get("complexity_level") or complexity_level_for_score(score, self.config.complexity_threshold))
+            buckets[level if level in buckets else complexity_level_for_score(score, self.config.complexity_threshold)].append(row)
 
         out = []
         for level, rows in buckets.items():

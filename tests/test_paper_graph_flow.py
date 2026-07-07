@@ -2,6 +2,102 @@ from new_experiments.core import EvidenceUnit, PaperExperimentRunner, RetrievalC
 from src.llms.base_client import LLMResponse
 
 
+class FakeComplexity:
+    def __init__(self, score):
+        self.score = score
+
+
+class FakeComplexityScorer:
+    def __init__(self, scores):
+        self.scores = scores
+
+    def compute(self, query):
+        return FakeComplexity(self.scores[query])
+
+
+def test_sample_hotpotqa_by_complexity_balances_low_medium_high_buckets():
+    import pandas as pd
+    from collections import Counter
+
+    from new_experiments.core import complexity_level_for_score, sample_hotpotqa_by_complexity
+
+    scores = {
+        "low-1": 0.1,
+        "low-2": 0.2,
+        "low-3": 0.3,
+        "mid-1": 0.5,
+        "mid-2": 0.6,
+        "mid-3": 0.7,
+        "high-1": 0.8,
+        "high-2": 0.9,
+        "high-3": 1.0,
+    }
+    data = pd.DataFrame({"id": list(scores), "question": list(scores)})
+
+    sampled = sample_hotpotqa_by_complexity(
+        data,
+        sample_size=6,
+        scorer=FakeComplexityScorer(scores),
+        random_seed=42,
+        complexity_threshold=0.8,
+    )
+
+    counts = Counter(complexity_level_for_score(scores[q], complexity_threshold=0.8) for q in sampled["question"])
+    assert counts == {"low": 2, "medium": 2, "high": 2}
+
+
+def test_sample_hotpotqa_by_complexity_matches_paper_500_each_when_total_is_1500():
+    import pandas as pd
+    from collections import Counter
+
+    from new_experiments.core import complexity_level_for_score, sample_hotpotqa_by_complexity
+
+    scores = {}
+    for prefix, score in (("low", 0.2), ("medium", 0.6), ("high", 0.9)):
+        for idx in range(600):
+            scores[f"{prefix}-{idx}"] = score
+    data = pd.DataFrame({"id": list(scores), "question": list(scores)})
+
+    sampled = sample_hotpotqa_by_complexity(
+        data,
+        sample_size=1500,
+        scorer=FakeComplexityScorer(scores),
+        random_seed=42,
+        complexity_threshold=0.8,
+    )
+
+    counts = Counter(complexity_level_for_score(scores[q], complexity_threshold=0.8) for q in sampled["question"])
+    assert counts == {"low": 500, "medium": 500, "high": 500}
+
+
+def test_sample_hotpotqa_by_complexity_uses_ranked_terciles_not_fixed_threshold_capacity():
+    import pandas as pd
+    from collections import Counter
+
+    from new_experiments.core import sample_hotpotqa_by_complexity
+
+    scores = {}
+    for idx in range(1600):
+        if idx < 700:
+            score = 0.2
+        elif idx < 1200:
+            score = 0.6
+        else:
+            score = 0.9
+        scores[f"q-{idx}"] = score
+    data = pd.DataFrame({"id": list(scores), "question": list(scores)})
+
+    sampled = sample_hotpotqa_by_complexity(
+        data,
+        sample_size=1500,
+        scorer=FakeComplexityScorer(scores),
+        random_seed=42,
+        complexity_threshold=0.8,
+    )
+
+    assert Counter(sampled["_complexity_level"]) == {"low": 500, "medium": 500, "high": 500}
+
+
 def test_prepare_paper_graph_rows_builds_structure_and_semantic_graph():
     from src.storage.graph_store.paper_graph_builder import prepare_paper_graph_rows
 
@@ -40,6 +136,58 @@ def test_prepare_paper_graph_rows_builds_structure_and_semantic_graph():
         ("beta", "based in", "paris"),
     }
     assert {link["section_id"] for link in rows["semantic_links"]} == {"section::alpha"}
+
+
+def test_prepare_paper_graph_rows_preserves_punctuation_distinct_titles():
+    from src.storage.graph_store.paper_graph_builder import prepare_paper_graph_rows
+
+    rows = prepare_paper_graph_rows(
+        [
+            {"title": "Warriors Path State Park", "sentence_total": "One."},
+            {"title": "Warriors' Path State Park", "sentence_total": "Two."},
+        ]
+    )
+
+    section_ids = [row["id"] for row in rows["sections"]]
+    assert len(set(section_ids)) == 2
+    assert section_ids[0] == "section::warriors_path_state_park"
+    assert section_ids[1].startswith("section::warriors_path_state_park::")
+
+
+class TinyEmbeddingClient:
+    def __init__(self):
+        self.calls = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return [[float(len(text)), 1.0] for text in texts]
+
+
+def test_attach_paper_graph_embeddings_adds_vectors_to_text_nodes_in_batches():
+    from src.storage.graph_store.paper_graph_builder import (
+        attach_paper_graph_embeddings,
+        prepare_paper_graph_rows,
+    )
+
+    rows = prepare_paper_graph_rows(
+        [
+            {
+                "title": "Alpha",
+                "sentence_total": "Alice founded Beta. Beta is based in Paris.",
+                "triplets": [{"Subject": "Alice", "Predicate": "founded", "Object": "Beta"}],
+            }
+        ]
+    )
+    embedding_client = TinyEmbeddingClient()
+
+    embedded = attach_paper_graph_embeddings(rows, embedding_client, batch_size=2)
+
+    assert embedded is rows
+    assert all("embedding" in row for row in rows["sections"])
+    assert all("embedding" in row for row in rows["paragraphs"])
+    assert all("embedding" in row for row in rows["sentences"])
+    assert rows["sections"][0]["embedding"] == [float(len("Alpha\nAlice founded Beta. Beta is based in Paris.")), 1.0]
+    assert len(embedding_client.calls) == 2
 
 
 def test_retrieval_metrics_deduplicate_titles_before_scoring():
@@ -364,6 +512,56 @@ class CountingEmbeddingClient:
         return arr / (norms + 1e-8)
 
 
+class StoredEmbeddingGraphStore:
+    def query(self, cypher, params=None):
+        if "MATCH (sec:Section)-[:HAS_PARAGRAPH]->(p:Paragraph)-[:HAS_SENTENCE]->(sent:Sentence)" in cypher:
+            return [
+                {
+                    "id": "sentence::alpha::0",
+                    "title": "Alpha",
+                    "content": "Alpha founded Beta.",
+                    "sent_id": 0,
+                    "paragraph_id": "paragraph::alpha::0",
+                    "embedding": [1.0, 0.0],
+                },
+                {
+                    "id": "sentence::gamma::0",
+                    "title": "Gamma",
+                    "content": "Gamma is unrelated.",
+                    "sent_id": 0,
+                    "paragraph_id": "paragraph::gamma::0",
+                    "embedding": [0.0, 1.0],
+                },
+            ]
+        return []
+
+
+class QueryOnlyEmbeddingClient:
+    dimension = 2
+
+    def __init__(self):
+        self.calls = []
+
+    def embed(self, texts, normalize=True):
+        import numpy as np
+
+        self.calls.append(texts)
+        if not isinstance(texts, str):
+            raise AssertionError("candidate evidence embeddings should come from Neo4j")
+        return np.array([[1.0, 0.0]], dtype=np.float32)
+
+
+def test_graph_semantic_retrieve_uses_stored_neo4j_embeddings_before_encoding_text():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = StoredEmbeddingGraphStore()
+    runner.embedding_client = QueryOnlyEmbeddingClient()
+
+    units = runner.graph_semantic_retrieve("Alpha Beta", "sentence", top_k=1)
+
+    assert units[0].title == "Alpha"
+    assert runner.embedding_client.calls == ["Alpha Beta"]
+
+
 def test_vector_retrieve_uses_neo4j_sentence_nodes_when_neo4j_required():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     runner.graph_store = SemanticGraphStore()
@@ -392,6 +590,36 @@ def test_vector_retrieve_uses_neo4j_paragraph_nodes_when_neo4j_required():
     assert units[0].content == "Alpha founded Beta. Beta is based in Paris."
     assert units[0].source == "graph_semantic_paragraph"
     assert units[0].metadata["section_source"] == "neo4j"
+
+
+def test_macrag_uses_fixed_multiscale_candidates_not_complexity_routing():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    calls = []
+
+    def fake_vector_retrieve(query, store_name="sentence", top_k=None):
+        calls.append((store_name, top_k))
+        return [
+            EvidenceUnit(
+                id=f"{store_name}-1",
+                title=f"{store_name.title()} Title",
+                content=f"{store_name} evidence",
+                score=0.9,
+                granularity=store_name,
+                is_sentence_level=store_name == "sentence",
+            )
+        ]
+
+    def fake_rerank(query, units, top_k=None):
+        return list(units)[:top_k]
+
+    runner.vector_retrieve = fake_vector_retrieve
+    runner.rerank_units = fake_rerank
+
+    result = runner.retrieve_macrag("Which person founded Alpha?")
+
+    assert calls == [("sentence", runner.config.k1), ("paragraph", max(1, runner.config.k1 // 2))]
+    assert result.stats["route"] == "macrag"
+    assert [unit.title for unit in result.units] == ["Sentence Title", "Paragraph Title"]
 
 
 def test_graph_semantic_retrieve_embeds_neo4j_units_once_per_granularity():

@@ -648,7 +648,7 @@ def test_adaptive_graph_route_expands_the_full_reranked_b0_with_controlled_neigh
     assert seen["use_snippet"] is True
 
 
-def test_graphrag_baseline_uses_broad_full_text_graph_expansion():
+def test_graphrag_baseline_uses_source_seed_window_graph_expansion():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     seeds = [
         EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
@@ -656,6 +656,9 @@ def test_graphrag_baseline_uses_broad_full_text_graph_expansion():
     ]
     seen = {}
     runner.vector_retrieve = lambda query, store_name, top_k=None: seeds
+    runner.select_with_budget = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("source GraphRAG slices initial+expanded directly")
+    )
 
     def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True):
         seen["titles"] = list(titles)
@@ -669,10 +672,10 @@ def test_graphrag_baseline_uses_broad_full_text_graph_expansion():
 
     runner.retrieve_graphrag("Alpha Beta")
 
-    assert seen["titles"] == [f"Seed {idx}" for idx in range(7)]
-    assert seen["hops"] == runner.config.hmax
-    assert seen["limit"] == runner.config.max_graph_neighbors
-    assert seen["seed_limit"] == runner.config.k3
+    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2"]
+    assert seen["hops"] == 1
+    assert seen["limit"] == runner.config.graph_expansion_limit_per_seed
+    assert seen["seed_limit"] == 3
     assert seen["use_snippet"] is False
 
 
@@ -960,38 +963,166 @@ def test_vector_retrieve_uses_neo4j_paragraph_nodes_when_neo4j_required():
     assert units[0].metadata["section_source"] == "neo4j"
 
 
-def test_macrag_uses_sentence_and_paragraph_candidates_without_parent_context():
+def test_semantic_rag_baseline_matches_source_file_direct_topk():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    seen = {}
+    units = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Title {idx}", content=f"Evidence {idx}", score=1.0 - idx / 10)
+        for idx in range(10)
+    ]
+
+    def fake_vector_retrieve(query, store_name="sentence", top_k=None):
+        seen["store_name"] = store_name
+        seen["top_k"] = top_k
+        return units[:top_k]
+
+    runner.vector_retrieve = fake_vector_retrieve
+
+    result = runner.retrieve_semantic_rag("Alpha Beta")
+
+    assert seen == {"store_name": "sentence", "top_k": runner.config.k3}
+    assert [unit.id for unit in result.units] == [f"sent::{idx}" for idx in range(runner.config.k3)]
+    assert result.stats["route"] == "semantic"
+
+
+def test_rerank_baseline_matches_source_file_without_title_deduplication():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    candidates = [
+        EvidenceUnit(id="sent::alpha::0", title="Alpha", content="First Alpha evidence.", score=0.9),
+        EvidenceUnit(id="sent::alpha::1", title="Alpha", content="Second Alpha evidence.", score=0.8),
+    ]
+    seen = {}
+    runner.vector_retrieve = lambda query, store_name="sentence", top_k=None: candidates
+
+    def fake_rerank(query, units, top_k=None):
+        seen["ids"] = [unit.id for unit in units]
+        seen["top_k"] = top_k
+        return list(units)
+
+    runner.rerank_units = fake_rerank
+
+    result = runner.retrieve_rerank_rag("Alpha")
+
+    assert seen == {"ids": ["sent::alpha::0", "sent::alpha::1"], "top_k": runner.config.k3}
+    assert [unit.id for unit in result.units] == ["sent::alpha::0", "sent::alpha::1"]
+    assert result.stats["route"] == "rerank"
+
+
+def test_graphrag_baseline_matches_source_file_seed_and_topk_flow():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    seeds = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
+        for idx in range(10)
+    ]
+    expanded = [
+        EvidenceUnit(id=f"graph::{idx}", title=f"Graph {idx}", content=f"Graph {idx} evidence.", score=0.5)
+        for idx in range(5)
+    ]
+    seen = {}
+    runner.vector_retrieve = lambda query, store_name="sentence", top_k=None: seeds
+    runner.select_with_budget = lambda query, units, max_units=None: (_ for _ in ()).throw(
+        AssertionError("source GraphRAG takes all_units[:k3], not the proposed budget selector")
+    )
+
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True):
+        seen["titles"] = list(titles)
+        seen["hops"] = hops
+        seen["limit"] = limit_per_seed
+        seen["seed_limit"] = seed_limit
+        seen["query"] = query
+        seen["use_snippet"] = use_snippet
+        return expanded
+
+    runner.graph_expand = fake_graph_expand
+
+    result = runner.retrieve_graphrag("Alpha Beta")
+
+    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2"]
+    assert seen["hops"] == 1
+    assert seen["limit"] == runner.config.graph_expansion_limit_per_seed
+    assert seen["seed_limit"] == 3
+    assert seen["query"] == "Alpha Beta"
+    assert seen["use_snippet"] is False
+    assert [unit.id for unit in result.units] == [f"sent::{idx}" for idx in range(runner.config.k3)]
+    assert result.stats["expanded_nodes"] == len(expanded)
+
+
+def test_kg_rag_baseline_matches_source_file_vector_keyword_rerank_only():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    vector = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha sentence.", score=0.9)
+    keyword = EvidenceUnit(id="kw::beta", title="Beta", content="Beta keyword paragraph.", score=0.6)
+    calls = []
+    seen = {}
+    runner.vector_retrieve = lambda query, store_name="sentence", top_k=None: calls.append((store_name, top_k)) or [vector]
+    runner.keyword_retrieve = lambda query, top_k=None: [keyword]
+    runner.graph_expand = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("source KG-RAG does not use graph expansion")
+    )
+    runner.select_with_budget = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("source KG-RAG returns reranked top-k directly")
+    )
+
+    def fake_rerank(query, units, top_k=None):
+        seen["ids"] = [unit.id for unit in units]
+        seen["top_k"] = top_k
+        return list(units)[:top_k]
+
+    runner.rerank_units = fake_rerank
+
+    result = runner.retrieve_kg_rag("Alpha Beta")
+
+    assert calls == [("sentence", runner.config.k1)]
+    assert seen == {"ids": ["sent::alpha::0", "kw::beta"], "top_k": runner.config.k3}
+    assert [unit.id for unit in result.units] == ["sent::alpha::0", "kw::beta"]
+    assert result.stats["expanded_nodes"] == 0
+    assert result.stats["route"] == "kg_rag"
+
+
+def test_macrag_baseline_matches_source_file_sentence_paragraph_rerank():
     runner = PaperExperimentRunner(RetrievalConfig())
     calls = []
+    seen = {}
 
     def fake_vector_retrieve(query, store_name="sentence", top_k=None):
         calls.append((store_name, top_k))
+        limit = top_k or 10
         return [
             EvidenceUnit(
-                id=f"{store_name}-1",
-                title=f"{store_name.title()} Title",
-                content=f"{store_name} evidence",
-                score=0.9,
+                id=f"{store_name}-{idx}",
+                title=f"{store_name.title()} Title {idx}",
+                content=f"{store_name} evidence {idx}",
+                score=0.9 - idx / 100,
                 granularity=store_name,
                 is_sentence_level=store_name == "sentence",
             )
+            for idx in range(limit)
         ]
 
     def fake_rerank(query, units, top_k=None):
+        seen["granularities"] = [unit.granularity for unit in units]
+        seen["top_k"] = top_k
         return list(units)[:top_k]
 
     runner.vector_retrieve = fake_vector_retrieve
     runner.rerank_units = fake_rerank
+    runner.complexity_scorer = type(
+        "NoComplexityForMacRAG",
+        (),
+        {"compute": lambda self, query: (_ for _ in ()).throw(AssertionError("source MacRAG does not route by complexity"))},
+    )()
     runner.parent_context_pool = lambda units: (_ for _ in ()).throw(
         AssertionError("MacRAG baseline should not use proposed parent context")
     )
-    runner.select_with_budget = lambda query, units, max_units=None: list(units)[:max_units]
+    runner.select_with_budget = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("source MacRAG returns reranked top-k directly")
+    )
 
     result = runner.retrieve_macrag("Which person founded Alpha?")
 
-    assert calls == [("sentence", runner.config.k1), ("paragraph", runner.config.k1 // 2)]
+    assert calls == [("sentence", runner.config.k1), ("paragraph", 5)]
+    assert seen == {"granularities": ["sentence"] * runner.config.k1 + ["paragraph"] * 5, "top_k": runner.config.k3}
+    assert [unit.id for unit in result.units] == [f"sentence-{idx}" for idx in range(runner.config.k3)]
     assert result.stats["route"] == "macrag"
-    assert [unit.title for unit in result.units] == ["Sentence Title", "Paragraph Title"]
 
 
 def test_fine_only_baseline_uses_shared_initial_candidates_without_parent():

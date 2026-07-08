@@ -1464,13 +1464,13 @@ class PaperExperimentRunner:
     # ------------------------------------------------------------------
     def retrieve_semantic_rag(self, query: str) -> MethodResult:
         start = time.perf_counter()
-        units = unique_by_title(self.vector_retrieve(query, "sentence", self.config.k1))[: self.config.k3]
+        units = self.vector_retrieve(query, "sentence", self.config.k3)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="semantic"))
 
     def retrieve_rerank_rag(self, query: str) -> MethodResult:
         start = time.perf_counter()
         candidates = self.vector_retrieve(query, "sentence", self.config.k1)
-        units = unique_by_title(self.rerank_units(query, candidates, self.config.k3))
+        units = self.rerank_units(query, candidates, self.config.k3)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="rerank"))
 
     def initial_reranked_candidates(self, query: str) -> List[EvidenceUnit]:
@@ -1480,42 +1480,30 @@ class PaperExperimentRunner:
 
     def retrieve_graphrag(self, query: str) -> MethodResult:
         start = time.perf_counter()
-        seeds = unique_by_title(self.vector_retrieve(query, "sentence", self.config.k1))[: self.config.k3]
+        initial = self.vector_retrieve(query, "sentence", self.config.k1)
         expanded = self.graph_expand(
-            [u.title for u in seeds],
-            hops=self.config.hmax,
-            limit_per_seed=self.config.max_graph_neighbors,
+            [u.title for u in initial[:3]],
+            hops=1,
+            limit_per_seed=self.config.graph_expansion_limit_per_seed,
             query=query,
-            seed_limit=self.config.k3,
+            seed_limit=3,
             use_snippet=False,
         )
-        units = self.select_with_budget(query, list(seeds) + expanded)
+        units = (list(initial) + expanded)[: self.config.k3]
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route="graphrag"))
 
     def retrieve_kg_rag(self, query: str) -> MethodResult:
         start = time.perf_counter()
         vector_units = self.vector_retrieve(query, "sentence", self.config.k1)
         keyword_units = self.keyword_retrieve(query, self.config.k2)
-        seeds = self.rerank_units(query, vector_units + keyword_units, self.config.k3)
-        expanded = self.graph_expand(
-            self.graph_seed_titles(seeds),
-            hops=1,
-            limit_per_seed=self.config.graph_expansion_limit_per_seed,
-            query=query,
-        )
-        units = self.select_with_budget(
-            query,
-            seeds + expanded,
-            max_units=self.config.k3 + self.config.k3 * self.config.graph_expansion_limit_per_seed,
-        )
-        return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route="kg_rag"))
+        units = self.rerank_units(query, vector_units + keyword_units, self.config.k3)
+        return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="kg_rag"))
 
     def retrieve_macrag(self, query: str) -> MethodResult:
         start = time.perf_counter()
         sent = self.vector_retrieve(query, "sentence", self.config.k1)
-        para = self.vector_retrieve(query, "paragraph", max(1, self.config.k1 // 2))
-        seeds = self.rerank_units(query, sent + para, self.config.k3)
-        units = self.select_with_budget(query, seeds, max_units=self.config.k3)
+        para = self.vector_retrieve(query, "paragraph", 5)
+        units = self.rerank_units(query, sent + para, self.config.k3)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="macrag"))
 
     def retrieve_fine_only(self, query: str) -> MethodResult:

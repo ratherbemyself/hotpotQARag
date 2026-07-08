@@ -8,6 +8,81 @@ The user wants the repository to reproduce the paper flow as strictly as possibl
 
 The important practical goal now is to understand and resolve why the implemented `Proposed` method has paper-like absolute metrics but does not clearly beat several strong baselines under the current fair/source-compatible evaluation.
 
+## Latest Final State: 2026-07-09
+
+The current working code has been re-stabilized after the graph-expansion over-fetch experiment. The final full run used:
+
+```powershell
+D:\cuda\venvs\vector-gpu\Scripts\python.exe -m new_experiments.all.run_all --sample-size 300 --max-workers 3
+```
+
+Result directory:
+
+```text
+D:\ew\test02\new_experiments\results\paper_hotpotqa_20260709_060513
+```
+
+This was the third and final allowed `300 x 15` full-flow run under the user's cap. It completed successfully against Neo4j database `paper7405`, with local CUDA embedding/reranker models and DeepSeek generation/judging.
+
+Key code state:
+
+| Area | Final decision |
+|---|---|
+| Neo4j source | Required by default; online evidence is read from Neo4j, not JSON documents |
+| Graph expansion | Uses paper-style bounded semantic graph expansion; it no longer over-fetches extra neighbors for lexical re-ranking |
+| Router | Keeps the heuristic/paper-feature router as default because DeepSeek LLM routing was worse in retrieval diagnostics |
+| DeepSeek client | Uses `extra_body={"thinking":{"type":"disabled"}}`, fixing the prior empty-response compatibility issue |
+| LLM router | Available behind `--llm-router`, but not used in the final run |
+
+Latest verification:
+
+```powershell
+D:\cuda\venvs\vector-gpu\Scripts\python.exe -m pytest tests -q
+```
+
+Latest result before this handoff:
+
+```text
+67 passed, 3 warnings
+```
+
+### Final 300-Sample Main Comparison
+
+| Method | Recall | Avg Len | ACC | Faith |
+|---|---:|---:|---:|---:|
+| Semantic RAG | 0.55 | 258.13 | 0.39 | 0.65 |
+| +Rerank | 0.56 | 264.02 | 0.42 | 0.64 |
+| GraphRAG | 0.58 | 256.47 | 0.45 | 0.70 |
+| KG-RAG | 0.65 | 390.31 | 0.48 | 0.67 |
+| MacRAG | 0.77 | 498.98 | 0.54 | 0.72 |
+| Proposed | 0.78 | 1150.82 | 0.51 | 0.74 |
+
+### Final 300-Sample Fixed-Scale Control
+
+| Variant | Recall | Avg Len | ACC | Faith |
+|---|---:|---:|---:|---:|
+| Fine only | 0.60 | 329.43 | 0.41 | 0.69 |
+| Uniform parent | 0.77 | 779.37 | 0.49 | 0.72 |
+| Fixed 1-hop | 0.60 | 2164.46 | 0.41 | 0.64 |
+| Fixed 2-hop | 0.60 | 2246.56 | 0.40 | 0.64 |
+| Proposed | 0.78 | 1150.82 | 0.53 | 0.73 |
+
+### Final 300-Sample Ablation
+
+| Setting | Recall | Avg Len | ACC | Faith |
+|---|---:|---:|---:|---:|
+| Full model | 0.78 | 1150.82 | 0.52 | 0.71 |
+| No graph expansion | 0.77 | 1029.36 | 0.52 | 0.71 |
+| No selective parent | 0.66 | 1570.84 | 0.48 | 0.65 |
+| No summary evidence | 0.78 | 1150.33 | 0.52 | 0.73 |
+
+Interpretation:
+
+- The final code follows the paper pipeline structure: initial sentence retrieval, reranking, adaptive routing, optional parent mapping, bounded graph expansion, summary evidence, budget selection, generation, and judge.
+- The most reproducible gain is still parent/context organization. Graph expansion gives a small retrieval gain, matching the paper's qualitative implication, but it does not materially improve ACC in this sample.
+- DeepSeek LLM routing was tested and rejected as default because it underperformed the heuristic router in retrieval diagnostics.
+- The paper's absolute `Proposed` Recall/AvgToken are close, but the paper's claim that `Proposed` clearly dominates all baselines is still not reproduced: MacRAG is much stronger under this fair/local implementation.
+
 ## Locations
 
 | Item | Path |
@@ -57,15 +132,15 @@ Neo4j ready: nodes=1024706, edges=2714190
 
 The evidence source for online retrieval is Neo4j, not JSON, when `require_neo4j=True`.
 
-## Current Verification
+## Previous Verification Note
 
-The current code was verified with:
+The code was previously verified with:
 
 ```powershell
 D:\cuda\venvs\vector-gpu\Scripts\python.exe -m pytest tests -q
 ```
 
-Latest result before this handoff:
+Older result before the latest 2026-07-09 changes:
 
 ```text
 59 passed, 3 warnings
@@ -328,4 +403,4 @@ If only retrieval metrics are needed and DeepSeek noise should be avoided, consi
 
 ## Current Best Summary
 
-The code now runs the Neo4j-based paper flow and the main comparison baselines are source-compatible with the user's original code. On 200 samples, `Proposed` has paper-like absolute Recall/Avg Len/ACC and the best main-method ACC, but it does not dominate all retrieval metrics because `MacRAG` and `Uniform parent` are very strong under the current fair implementation. The next useful work is to decide whether to keep source-compatible baselines or add a separate paper-strict baseline profile, then rerun 200 samples and report the mismatch honestly.
+The code now runs the Neo4j-based paper flow, with the main comparison baselines source-compatible with the user's original code and the adaptive flow aligned to the paper's described modules. On the final 300-sample run, `Proposed` has paper-like absolute Recall and lower-than-paper Avg Len, but it does not clearly dominate the strongest local baselines. The strongest verified contribution is selective parent/context organization; graph expansion is useful but small, and DeepSeek-as-router did not outperform the heuristic router.

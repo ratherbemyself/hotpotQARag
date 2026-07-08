@@ -83,13 +83,16 @@ class DeepSeekClient(BaseLLMClient):
         start_time = time.time()
         
         try:
+            request_kwargs = dict(kwargs)
+            extra_body = {"thinking": {"type": "disabled"}}
+            extra_body.update(request_kwargs.pop("extra_body", {}) or {})
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_dict() for m in messages],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"enable_thinking": False},
-                **kwargs,
+                extra_body=extra_body,
+                **request_kwargs,
             )
             
             latency = time.time() - start_time
@@ -154,12 +157,14 @@ class DeepSeekClient(BaseLLMClient):
         try:
             request_kwargs = dict(kwargs)
             request_kwargs["stream"] = True
+            extra_body = {"thinking": {"type": "disabled"}}
+            extra_body.update(request_kwargs.pop("extra_body", {}) or {})
             stream = self._client.chat.completions.create(
                 model=self.model,
                 messages=[m.to_dict() for m in messages],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"enable_thinking": False},
+                extra_body=extra_body,
                 **request_kwargs,
             )
             

@@ -179,6 +179,35 @@ def test_deepseek_generate_honors_explicit_sampling_and_token_limits():
     assert response.content == "ok"
     assert captured["temperature"] == 0.12
     assert captured["max_tokens"] == 17
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_deepseek_generate_merges_custom_extra_body_with_disabled_thinking():
+    from src.llms.base_client import Message
+    from src.llms.deepseek_client import DeepSeekClient
+
+    captured = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+    client = DeepSeekClient.__new__(DeepSeekClient)
+    client.model = "deepseek-v4-flash"
+    client._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    client.generate(
+        [Message(role="user", content="hello")],
+        temperature=0.0,
+        max_tokens=8,
+        extra_body={"custom_flag": True},
+    )
+
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}, "custom_flag": True}
 
 
 def test_deepseek_stream_generate_uses_streaming_response_and_yields_chunks():
@@ -212,3 +241,4 @@ def test_deepseek_stream_generate_uses_streaming_response_and_yields_chunks():
     assert captured["stream"] is True
     assert captured["temperature"] == 0.2
     assert captured["max_tokens"] == 9
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}

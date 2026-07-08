@@ -1,4 +1,5 @@
 from new_experiments.core import EvidenceUnit, PaperExperimentRunner, RetrievalConfig
+from new_experiments.route_diagnostics import choose_best_route, restore_balanced_samples, summarize_records
 from src.llms.base_client import LLMResponse
 
 
@@ -342,6 +343,17 @@ class ExpansionGraphStore:
         return [{"title": "Beta", "content": self.content, "sentences": self.sentences}]
 
 
+class MultiExpansionGraphStore:
+    def __init__(self, rows):
+        self.rows = rows
+        self.queries = []
+
+    def query(self, cypher, params=None):
+        self.queries.append((cypher, params or {}))
+        limit = int((params or {}).get("limit", len(self.rows)))
+        return self.rows[:limit]
+
+
 class ParentBySentenceGraphStore:
     def __init__(self):
         self.queries = []
@@ -489,6 +501,29 @@ def test_graph_expand_deduplicates_repeated_sentence_rows_from_multiple_semantic
     assert units[0].metadata["sentence_ids"] == ["1"]
 
 
+def test_graph_expand_honors_explicit_neighbor_limit_without_overfetching():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True, max_graph_neighbors=3))
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": "Noise",
+                "content": "Unrelated page about geography.",
+                "sentences": [{"id": 0, "text": "Unrelated page about geography."}],
+            },
+            {
+                "title": "Beta",
+                "content": "Alpha Beta bridge fact gives the useful evidence.",
+                "sentences": [{"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."}],
+            },
+        ]
+    )
+
+    units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=1, query="Alpha Beta")
+
+    assert [unit.title for unit in units] == ["Noise"]
+    assert runner.graph_store.queries[0][1]["limit"] == 1
+
+
 def test_parent_map_aggregates_trigger_sentence_positions_for_same_parent():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     runner.graph_store = FakeGraphStore()
@@ -551,20 +586,23 @@ def test_local_parent_route_keeps_initial_evidence_and_adds_parent_context():
     assert result.units[1].metadata["trigger_sentence_ids"] == ["0"]
 
 
-def test_fixed_graph_variant_uses_shared_initial_candidates_and_fixed_broad_expansion():
+def test_fixed_graph_variant_uses_source_fixed_scale_candidate_flow():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     runner.graph_store = FakeGraphStore()
     vectors = [
         EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
         for idx in range(5)
     ]
-    keywords = [
-        EvidenceUnit(id=f"kw::{idx}", title=f"Keyword {idx}", content=f"Keyword {idx} evidence.", score=0.5 - idx / 10)
-        for idx in range(2)
-    ]
     seen = {}
-    runner.vector_retrieve = lambda query, store_name, top_k=None: vectors
-    runner.keyword_retrieve = lambda query, top_k=None: keywords
+
+    def fake_vector(query, store_name, top_k=None):
+        seen["vector"] = {"query": query, "store_name": store_name, "top_k": top_k}
+        return vectors
+
+    runner.vector_retrieve = fake_vector
+    runner.keyword_retrieve = lambda query, top_k=None: (_ for _ in ()).throw(
+        AssertionError("source fixed-scale graph variants use only sentence vector candidates")
+    )
 
     def fake_rerank(query, units, top_k=None):
         seen["ids"] = [unit.id for unit in units]
@@ -585,31 +623,124 @@ def test_fixed_graph_variant_uses_shared_initial_candidates_and_fixed_broad_expa
 
     runner.retrieve_fixed_graph("Alpha Beta", hops=1)
 
-    assert seen["ids"] == [unit.id for unit in vectors + keywords]
+    assert seen["vector"] == {"query": "Alpha Beta", "store_name": "sentence", "top_k": runner.config.k1}
+    assert seen["ids"] == [unit.id for unit in vectors]
     assert seen["top_k"] == runner.config.k3
-    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2", "Seed 3", "Seed 4", "Keyword 0", "Keyword 1"]
+    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2"]
     assert seen["hops"] == 1
-    assert seen["limit"] == runner.config.max_graph_neighbors
+    assert seen["limit"] == runner.config.graph_expansion_limit_per_seed
     assert seen["query"] == "Alpha Beta"
     assert seen["use_snippet"] is False
 
 
 def test_fixed_graph_variant_does_not_mix_in_parent_scale():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
-    seed = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha founded Beta.", score=0.9)
+    seeds = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
+        for idx in range(runner.config.k3)
+    ]
     expanded = EvidenceUnit(id="graph::beta", title="Beta", content="Beta expanded.", score=0.5)
-    runner.vector_retrieve = lambda query, store_name, top_k=None: [seed]
+    runner.vector_retrieve = lambda query, store_name, top_k=None: seeds
     runner.keyword_retrieve = lambda query, top_k=None: []
     runner.rerank_units = lambda query, units, top_k=None: list(units)
     runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="", use_snippet=True: [expanded]
     runner.parent_context_pool = lambda units: (_ for _ in ()).throw(
         AssertionError("fixed graph variants should isolate graph expansion from parent scale")
     )
-    runner.select_with_budget = lambda query, units, max_units=None: list(units)
+    runner.select_with_budget = lambda query, units, max_units=None: (_ for _ in ()).throw(
+        AssertionError("source fixed-scale graph variants slice reranked+expanded directly")
+    )
 
     result = runner.retrieve_fixed_graph("Alpha Beta", hops=1)
 
-    assert [unit.id for unit in result.units] == ["sent::alpha::0", "graph::beta"]
+    assert [unit.id for unit in result.units] == [unit.id for unit in seeds] + ["graph::beta"]
+
+
+def test_route_diagnostics_best_route_prefers_recall_then_lower_token_cost():
+    rows = [
+        {"method": "fine_grained", "recall": 0.5, "avg_len": 200, "expanded_nodes": 0},
+        {"method": "local_parent", "recall": 1.0, "avg_len": 900, "expanded_nodes": 0},
+        {"method": "graph_expansion", "recall": 1.0, "avg_len": 1600, "expanded_nodes": 8},
+        {"method": "proposed", "recall": 1.0, "avg_len": 1600, "expanded_nodes": 8},
+    ]
+
+    assert choose_best_route(rows) == "local_parent"
+
+
+def test_route_diagnostics_summary_groups_by_original_route_and_method():
+    rows = [
+        {
+            "original_route": "graph_expansion",
+            "method": "fine_grained",
+            "recall": 0.5,
+            "precision": 0.2,
+            "avg_len": 100,
+            "expanded_nodes": 0,
+            "time_ms": 10,
+        },
+        {
+            "original_route": "graph_expansion",
+            "method": "fine_grained",
+            "recall": 1.0,
+            "precision": 0.4,
+            "avg_len": 300,
+            "expanded_nodes": 0,
+            "time_ms": 30,
+        },
+    ]
+
+    assert summarize_records(rows) == [
+        {
+            "original_route": "graph_expansion",
+            "method": "fine_grained",
+            "n": 2,
+            "recall": 0.75,
+            "precision": 0.3,
+            "avg_len": 200.0,
+            "expanded_nodes": 0.0,
+            "time_ms": 20.0,
+        }
+    ]
+
+
+def test_route_diagnostics_restores_balanced_csv_rows_from_source_data():
+    import pandas as pd
+
+    source = pd.DataFrame(
+        [
+            {
+                "id": "alpha",
+                "question": "Who founded Alpha?",
+                "supporting_facts": {"title": ["Alpha"], "sent_id": [0]},
+                "context": {"title": ["Alpha"], "sentences": [["Alpha was founded by Beta."]]},
+            },
+            {
+                "id": "beta",
+                "question": "Who founded Beta?",
+                "supporting_facts": {"title": ["Beta"], "sent_id": [0]},
+                "context": {"title": ["Beta"], "sentences": [["Beta was founded by Gamma."]]},
+            },
+        ]
+    )
+    csv_rows = pd.DataFrame(
+        [
+            {
+                "id": "beta",
+                "question": "stale csv question",
+                "supporting_facts": "{'title': ['wrong']}",
+                "_diagnostic_route": "graph_expansion",
+                "_route_detail": '{"route":"graph_expansion"}',
+                "_scan_order": 7,
+            }
+        ]
+    )
+
+    restored = restore_balanced_samples(source, csv_rows)
+
+    assert restored.iloc[0]["question"] == "Who founded Beta?"
+    assert restored.iloc[0]["supporting_facts"] == {"title": ["Beta"], "sent_id": [0]}
+    assert restored.iloc[0]["_diagnostic_route"] == "graph_expansion"
+    assert restored.iloc[0]["_scan_order"] == 7
 
 
 def test_adaptive_graph_route_expands_the_full_reranked_b0_with_controlled_neighbor_limit():
@@ -1299,23 +1430,63 @@ def test_judge_answer_retries_until_parseable_metric_json():
     assert all(call[3]["response_format"] == {"type": "json_object"} for call in llm.calls)
 
 
-def test_adaptive_route_uses_multihop_indicator_as_graph_trigger():
+class RouterLLM:
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+
+    def generate(self, messages, temperature, max_tokens, **kwargs):
+        self.calls.append((messages, temperature, max_tokens, kwargs))
+        return LLMResponse(content=self.content, success=True)
+
+
+def test_llm_router_parses_deepseek_json_route_and_records_fallback_detail():
+    runner = PaperExperimentRunner(RetrievalConfig(use_llm_router=True))
+    runner.llm_client = RouterLLM('{"route": "local_parent", "reason": "needs parent context"}')
+    candidates = [
+        EvidenceUnit(
+            id="sent::alpha::0",
+            title="Alpha",
+            content="Alpha founded Beta.",
+            score=0.9,
+            is_sentence_level=True,
+        )
+    ]
+
+    route, detail = runner.choose_llm_route("Who founded Alpha?", candidates)
+
+    assert route == "local_parent"
+    assert detail["router"] == "deepseek"
+    assert detail["llm_reason"] == "needs parent context"
+    assert runner.llm_client.calls[0][1:] == (0.0, 128, {"response_format": {"type": "json_object"}})
+
+
+def test_adaptive_route_uses_fragmented_multihop_candidates_as_graph_trigger():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     candidates = [
         EvidenceUnit(
             id="sent::alpha::0",
             title="Alpha",
-            content="Alpha and Beta are both artists with related careers.",
+            content="Alpha was an artist whose collaborator was named Gamma.",
             score=0.95,
             source="graph_semantic_sentence",
             granularity="sentence",
             is_sentence_level=True,
         ),
         EvidenceUnit(
-            id="sent::alpha::1",
-            title="Alpha",
-            content="Alpha worked with Beta.",
+            id="sent::beta::0",
+            title="Beta",
+            content="Beta was an artist whose collaborator was named Delta.",
             score=0.9,
+            source="graph_semantic_sentence",
+            granularity="sentence",
+            is_sentence_level=True,
+        ),
+        EvidenceUnit(
+            id="sent::gamma::0",
+            title="Gamma",
+            content="Gamma and Delta were linked through a shared exhibition.",
+            score=0.85,
             source="graph_semantic_sentence",
             granularity="sentence",
             is_sentence_level=True,
@@ -1326,6 +1497,83 @@ def test_adaptive_route_uses_multihop_indicator_as_graph_trigger():
 
     assert detail["multi_hop_indicator"] is True
     assert route == "graph_expansion"
+
+
+def test_adaptive_route_uses_parent_for_complete_concentrated_multihop_candidates():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    candidates = [
+        EvidenceUnit(
+            id="sent::alpha::0",
+            title="Alpha",
+            content=(
+                "Alpha and Beta are both artists with related careers, shared exhibitions, "
+                "documented biographies, public performances, gallery records, and clear "
+                "career descriptions that directly answer the comparison question."
+            ),
+            score=0.95,
+            source="graph_semantic_sentence",
+            granularity="sentence",
+            is_sentence_level=True,
+        ),
+        EvidenceUnit(
+            id="sent::alpha::1",
+            title="Alpha",
+            content=(
+                "The same Alpha record states that Beta is also an artist, so the answer "
+                "does not need an additional semantic graph bridge or parent expansion."
+            ),
+            score=0.9,
+            source="graph_semantic_sentence",
+            granularity="sentence",
+            is_sentence_level=True,
+        ),
+    ]
+
+    route, detail = runner.choose_adaptive_route("Are Alpha and Beta both artists?", candidates)
+
+    assert detail["multi_hop_indicator"] is True
+    assert detail["fragmentation"] <= 0.35
+    assert route == "local_parent"
+
+
+def test_adaptive_route_uses_parent_for_concentrated_but_complex_candidates():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    candidates = [
+        EvidenceUnit(
+            id="sent::alpha::0",
+            title="Alpha",
+            content=(
+                "Alpha and Beta are both artists with related careers, shared exhibitions, "
+                "documented biographies, public performances, gallery records, chronology, "
+                "nationality, genre, awards, collaborations, and multiple stated constraints."
+            ),
+            score=0.95,
+            source="graph_semantic_sentence",
+            granularity="sentence",
+            is_sentence_level=True,
+        ),
+        EvidenceUnit(
+            id="sent::alpha::1",
+            title="Alpha",
+            content=(
+                "The same Alpha record also describes Beta as an artist, but the question "
+                "asks for several constraints that benefit from the parent context."
+            ),
+            score=0.9,
+            source="graph_semantic_sentence",
+            granularity="sentence",
+            is_sentence_level=True,
+        ),
+    ]
+
+    route, detail = runner.choose_adaptive_route(
+        "Are Alpha and Beta both artists with the same nationality, genre, awards, collaborators, and exhibition chronology?",
+        candidates,
+    )
+
+    assert detail["fragmentation"] <= 0.35
+    assert detail["complexity_score"] >= 0.45
+    assert route == "local_parent"
 
 
 def test_adaptive_route_keeps_fine_grained_when_low_complexity_and_complete():

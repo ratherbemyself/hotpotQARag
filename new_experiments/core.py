@@ -63,6 +63,7 @@ class RetrievalConfig:
     use_api_reranker: bool = False
     require_neo4j: bool = True
     complexity_stratified_sampling: bool = True
+    use_llm_router: bool = False
     
     max_workers: int = 1
     checkpoint_interval: int = 10
@@ -559,6 +560,7 @@ class PaperExperimentRunner:
         self._graph_retrieve_cache: Dict[str, List[EvidenceUnit]] = {}
         self._graph_embedding_cache: Dict[str, np.ndarray] = {}
         self._graph_vector_index_cache: Dict[str, bool] = {}
+        self._llm_route_cache: Dict[str, Tuple[str, Dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------
     # 资源加载
@@ -636,7 +638,7 @@ class PaperExperimentRunner:
             self.graph_store = None
 
     def _load_optional_clients(self) -> None:
-        if self.config.run_generation or self.config.run_judge:
+        if self.config.run_generation or self.config.run_judge or self.config.use_llm_router:
             from src.llms.deepseek_client import DeepSeekClient
 
             self.llm_client = DeepSeekClient()
@@ -1537,7 +1539,7 @@ class PaperExperimentRunner:
             units = self.parent_map(reranked)
             return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="parent_all"))
 
-        route, route_detail = self.choose_adaptive_route(query, reranked)
+        route, route_detail = self.choose_route(query, reranked)
         selected: List[EvidenceUnit]
         expanded: List[EvidenceUnit] = []
 
@@ -1578,29 +1580,132 @@ class PaperExperimentRunner:
 
     def retrieve_fixed_graph(self, query: str, hops: int) -> MethodResult:
         start = time.perf_counter()
-        seeds = self.initial_reranked_candidates(query)
+        vec_results = self.vector_retrieve(query, "sentence", self.config.k1)
+        reranked = self.rerank_units(query, vec_results, self.config.k3)
         expanded = self.graph_expand(
-            self.graph_seed_titles(seeds),
+            [unit.title for unit in reranked[:3]],
             hops=hops,
-            limit_per_seed=self.config.max_graph_neighbors,
+            limit_per_seed=self.config.graph_expansion_limit_per_seed,
             query=query,
             use_snippet=False,
         )
-        units = self.select_with_budget(query, list(seeds) + expanded)
+        units = list(reranked) + expanded
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route=f"fixed_{hops}hop"))
+
+    def choose_route(self, query: str, candidates: Sequence[EvidenceUnit]) -> Tuple[str, Dict[str, Any]]:
+        if self.config.use_llm_router:
+            return self.choose_llm_route(query, candidates)
+        return self.choose_adaptive_route(query, candidates)
+
+    def choose_llm_route(self, query: str, candidates: Sequence[EvidenceUnit]) -> Tuple[str, Dict[str, Any]]:
+        candidate_key = ",".join(unit.id for unit in candidates[: self.config.k3])
+        cache_key = f"{query}::{candidate_key}"
+        if cache_key in self._llm_route_cache:
+            cached_route, cached_detail = self._llm_route_cache[cache_key]
+            return cached_route, dict(cached_detail)
+
+        fallback_route, fallback_detail = self.choose_adaptive_route(query, candidates)
+        if self.llm_client is None:
+            detail = {
+                **fallback_detail,
+                "router": "heuristic_fallback",
+                "llm_error": "llm_client_unavailable",
+                "heuristic_route": fallback_route,
+                "route": fallback_route,
+            }
+            self._llm_route_cache[cache_key] = (fallback_route, detail)
+            return fallback_route, detail
+
+        route_options = ("fine_grained", "local_parent", "graph_expansion")
+        candidate_rows = []
+        for idx, unit in enumerate(candidates[: self.config.k3], start=1):
+            candidate_rows.append(
+                {
+                    "rank": idx,
+                    "title": unit.title,
+                    "granularity": unit.granularity,
+                    "is_sentence_level": unit.is_sentence_level,
+                    "score": round(float(unit.score or 0.0), 4),
+                    "content": unit.content[:260],
+                }
+            )
+        feature_payload = {
+            key: value
+            for key, value in fallback_detail.items()
+            if key not in {"route", "complete_concentrated", "graph_needed"}
+        }
+        prompt = (
+            "You are the routing module for the paper's adaptive RAG workflow. "
+            "Choose exactly one route for the question and retrieved evidence.\n\n"
+            "Route definitions:\n"
+            "- fine_grained: use sentence-level evidence only when the top evidence is already sufficient and concise.\n"
+            "- local_parent: map sentence evidence to its parent section/paragraph when local context is likely enough.\n"
+            "- graph_expansion: expand through the semantic graph only when evidence is fragmented or a bridge relation is needed.\n\n"
+            f"Question: {query}\n\n"
+            f"Heuristic features: {json.dumps(feature_payload, ensure_ascii=False)}\n"
+            f"Top evidence: {json.dumps(candidate_rows, ensure_ascii=False)}\n\n"
+            'Return only JSON: {"route":"fine_grained|local_parent|graph_expansion","reason":"short reason"}'
+        )
+
+        from src.llms.base_client import Message
+
+        response = self.llm_client.generate(
+            [Message(role="user", content=prompt)],
+            temperature=0.0,
+            max_tokens=128,
+            response_format={"type": "json_object"},
+        )
+        parsed = self._parse_json_object(response.content) if response.success else None
+        route = str(parsed.get("route", "")).strip() if parsed else ""
+        if route not in route_options:
+            detail = {
+                **fallback_detail,
+                "router": "heuristic_fallback",
+                "llm_error": getattr(response, "error", None) or "invalid_route",
+                "llm_raw": getattr(response, "content", "")[:500],
+                "heuristic_route": fallback_route,
+                "route": fallback_route,
+            }
+            self._llm_route_cache[cache_key] = (fallback_route, detail)
+            return fallback_route, detail
+
+        detail = {
+            **fallback_detail,
+            "router": "deepseek",
+            "heuristic_route": fallback_route,
+            "llm_reason": str(parsed.get("reason", ""))[:500],
+            "route": route,
+        }
+        self._llm_route_cache[cache_key] = (route, detail)
+        return route, detail
 
     def choose_adaptive_route(self, query: str, candidates: Sequence[EvidenceUnit]) -> Tuple[str, Dict[str, Any]]:
         complexity = self.complexity_scorer.compute(query)
         evidence_status = self.evaluate_evidence_status(candidates, query)
 
-        if (
-            complexity.multi_hop_indicator
-            or complexity.score >= self.config.complexity_threshold
-            or evidence_status.fragmentation >= self.config.fragmentation_threshold
-        ):
-            route = "graph_expansion"
-        elif evidence_status.score >= self.config.parent_threshold and evidence_status.short_sentence_ratio < 0.4:
+        complete_concentrated = (
+            evidence_status.score >= self.config.parent_threshold
+            and evidence_status.fragmentation <= 0.35
+            and complexity.score < 0.45
+            and evidence_status.short_sentence_ratio < 0.4
+            and (
+                evidence_status.complementarity >= self.config.complexity_threshold
+                or (len(candidates) <= 2 and evidence_status.complementarity >= self.config.parent_threshold)
+            )
+        )
+        fragmented = evidence_status.fragmentation >= self.config.fragmentation_threshold
+        graph_complementarity_threshold = max(0.0, self.config.complexity_threshold - 0.05)
+        graph_complexity_threshold = max(0.0, self.config.complexity_threshold - 0.10)
+        graph_needed = fragmented and (
+            complexity.score >= graph_complexity_threshold
+            or evidence_status.complementarity <= graph_complementarity_threshold
+            or (complexity.multi_hop_indicator and evidence_status.score < self.config.parent_threshold)
+        )
+
+        if complete_concentrated:
             route = "fine_grained"
+        elif graph_needed:
+            route = "graph_expansion"
         else:
             route = "local_parent"
 
@@ -1615,6 +1720,8 @@ class PaperExperimentRunner:
             "complementarity": evidence_status.complementarity,
             "short_sentence_ratio": evidence_status.short_sentence_ratio,
             "shared_parent_ratio": evidence_status.shared_parent_ratio,
+            "complete_concentrated": complete_concentrated,
+            "graph_needed": graph_needed,
             "route": route,
         }
 

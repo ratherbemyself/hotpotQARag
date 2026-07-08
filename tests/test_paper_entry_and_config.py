@@ -23,6 +23,74 @@ def test_paper_defaults_match_required_local_models():
     assert config.use_api_reranker is False
 
 
+def test_paper_graph_expansion_uses_k3_as_b0_seed_count():
+    from new_experiments.core import EvidenceUnit, PaperExperimentRunner, RetrievalConfig
+
+    config = RetrievalConfig(k3=7)
+    runner = PaperExperimentRunner(config)
+    units = [
+        EvidenceUnit(id=f"unit::{idx}", title=f"Title {idx}", content="evidence", score=1.0)
+        for idx in range(9)
+    ]
+
+    assert runner.graph_seed_titles(units) == [f"Title {idx}" for idx in range(7)]
+
+
+def test_local_reranker_defaults_to_sentence_transformers_backend(monkeypatch):
+    import src.retrievers.reranker as reranker_module
+
+    class FakeCrossEncoder:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class HangingFlagReranker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("FlagEmbedding backend must be opt-in for local paper runs")
+
+    monkeypatch.setattr(reranker_module, "SENTENCE_TRANSFORMERS_AVAILABLE", True)
+    monkeypatch.setattr(reranker_module, "FLAG_EMBEDDING_AVAILABLE", True)
+    monkeypatch.setattr(reranker_module, "CrossEncoder", FakeCrossEncoder)
+    monkeypatch.setattr(reranker_module, "FlagReranker", HangingFlagReranker)
+    monkeypatch.setattr(
+        reranker_module,
+        "get_config",
+        lambda: SimpleNamespace(rerank_model="BAAI/bge-reranker-base"),
+    )
+    monkeypatch.delenv("RERANK_BACKEND", raising=False)
+
+    reranker = reranker_module.Reranker()
+
+    assert reranker.get_model_info()["backend"] == "sentence_transformers"
+
+
+def test_local_reranker_prefers_downloaded_model_directory(tmp_path, monkeypatch):
+    import src.retrievers.reranker as reranker_module
+
+    local_model = tmp_path / "models" / "BAAI" / "bge-reranker-base"
+    local_model.mkdir(parents=True)
+    captured = {}
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name_or_path, *args, **kwargs):
+            captured["model"] = model_name_or_path
+
+    monkeypatch.setattr(reranker_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(reranker_module, "SENTENCE_TRANSFORMERS_AVAILABLE", True)
+    monkeypatch.setattr(reranker_module, "FLAG_EMBEDDING_AVAILABLE", False)
+    monkeypatch.setattr(reranker_module, "CrossEncoder", FakeCrossEncoder)
+    monkeypatch.setattr(
+        reranker_module,
+        "get_config",
+        lambda: SimpleNamespace(rerank_model="BAAI/bge-reranker-base"),
+    )
+
+    reranker = reranker_module.Reranker()
+
+    assert captured["model"] == str(local_model)
+    assert reranker.get_model_info()["model_name"] == str(local_model)
+
+
 def test_deepseek_env_aliases_are_honored(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_BASE", raising=False)

@@ -4,8 +4,10 @@
 支持 BGE-reranker、cross-encoder 和 API 调用重排序。
 """
 
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +17,22 @@ from src.utils.logger import get_logger
 from src.retrievers.base_retriever import SearchResult
 
 logger = get_logger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_local_rerank_model(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return model_name
+    if Path(str(model_name)).exists():
+        return str(model_name)
+    if "/" not in str(model_name):
+        return model_name
+
+    org, name = str(model_name).split("/", 1)
+    local_path = PROJECT_ROOT / "models" / org / name
+    if local_path.exists():
+        return str(local_path)
+    return model_name
 
 
 @dataclass
@@ -42,6 +60,9 @@ except ImportError:
     logger.warning(
         "未安装 FlagEmbedding。请使用以下命令安装：pip install FlagEmbedding"
     )
+
+
+FLAG_EMBEDDING_IMPORT_AVAILABLE = FLAG_EMBEDDING_AVAILABLE
 
 
 class Reranker:
@@ -76,7 +97,7 @@ class Reranker:
         """
         config = get_config()
         
-        self.model_name = config.rerank_model
+        self.model_name = resolve_local_rerank_model(config.rerank_model)
         self.batch_size = batch_size
         self.max_length = max_length
         self.use_fp16 = use_fp16
@@ -88,6 +109,10 @@ class Reranker:
         logger.debug(f"初始化重排序器: model={self.model_name}")
     
     def _init_model(self, **kwargs: Any) -> None:
+        global FLAG_EMBEDDING_AVAILABLE
+        requested_backend = str(kwargs.pop("backend", "") or os.getenv("RERANK_BACKEND", "sentence_transformers")).lower()
+        flag_requested = requested_backend in {"flag", "flag_embedding", "flagembedding"}
+        FLAG_EMBEDDING_AVAILABLE = FLAG_EMBEDDING_IMPORT_AVAILABLE and flag_requested
         """初始化模型
         
         Args:

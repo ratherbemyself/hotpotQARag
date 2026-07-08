@@ -206,7 +206,7 @@ def test_retrieval_metrics_deduplicate_titles_before_scoring():
     assert metrics.map_score <= 1.0
 
 
-def test_support_fact_metrics_do_not_count_wrong_sentence_from_relevant_title():
+def test_support_fact_metrics_do_not_count_wrong_sentence_or_wrong_paragraph_from_relevant_title():
     from new_experiments.core import compute_support_fact_metrics
 
     metrics = compute_support_fact_metrics(
@@ -222,9 +222,10 @@ def test_support_fact_metrics_do_not_count_wrong_sentence_from_relevant_title():
             EvidenceUnit(
                 id="parent::beta",
                 title="Beta",
-                content="The parent paragraph contains the support sentence.",
+                content="The parent paragraph is from the relevant title but not the support sentence.",
                 score=0.8,
                 granularity="paragraph",
+                metadata={"sentence_ids": ["1"]},
             ),
         ],
         relevant_facts={("Alpha", "0"), ("Beta", "2")},
@@ -232,8 +233,91 @@ def test_support_fact_metrics_do_not_count_wrong_sentence_from_relevant_title():
         latency_ms=5,
     )
 
-    assert metrics.recall == 0.5
-    assert metrics.mrr == 0.5
+    assert metrics.recall == 0.0
+    assert metrics.mrr == 0.0
+
+
+def test_support_fact_metrics_count_parent_paragraph_when_it_contains_support_sentence_id():
+    from new_experiments.core import compute_support_fact_metrics
+
+    metrics = compute_support_fact_metrics(
+        retrieved_units=[
+            EvidenceUnit(
+                id="parent::beta",
+                title="Beta",
+                content="The parent paragraph contains the support sentence.",
+                score=0.8,
+                granularity="paragraph",
+                metadata={"sentence_ids": ["2", "3"]},
+            ),
+        ],
+        relevant_facts={("Beta", "2")},
+        avg_context_len=10,
+        latency_ms=5,
+    )
+
+    assert metrics.recall == 1.0
+    assert metrics.mrr == 1.0
+
+
+def test_paper_table_metrics_use_support_fact_labels_for_ranking_metrics():
+    from new_experiments.core import ExperimentMetrics, compute_paper_table_metrics
+
+    support_metrics = ExperimentMetrics(
+        recall=0.5,
+        precision=0.25,
+        mrr=0.2,
+        ndcg=0.3,
+        map_score=0.4,
+        avg_len=123.0,
+        time_ms=45.0,
+        expanded_nodes=6.0,
+    )
+    title_metrics = ExperimentMetrics(
+        recall=1.0,
+        precision=1.0,
+        mrr=0.75,
+        ndcg=0.8,
+        map_score=0.7,
+        avg_len=999.0,
+        time_ms=999.0,
+        expanded_nodes=999.0,
+    )
+
+    paper_metrics = compute_paper_table_metrics(support_metrics, title_metrics)
+
+    assert paper_metrics.recall == 0.5
+    assert paper_metrics.precision == 0.25
+    assert paper_metrics.mrr == 0.2
+    assert paper_metrics.ndcg == 0.3
+    assert paper_metrics.map_score == 0.4
+    assert paper_metrics.avg_len == 123.0
+    assert paper_metrics.time_ms == 45.0
+    assert paper_metrics.expanded_nodes == 6.0
+
+
+def test_summary_uses_support_fact_metrics_when_paper_metrics_present():
+    from new_experiments.core import ExperimentMetrics
+
+    runner = PaperExperimentRunner(RetrievalConfig())
+    strict_metrics = ExperimentMetrics(recall=0.5, precision=0.25, mrr=0.2, ndcg=0.3, map_score=0.4)
+    paper_metrics = ExperimentMetrics(recall=0.5, precision=0.25, mrr=0.75, ndcg=0.8, map_score=0.7)
+
+    summary = runner.aggregate_method_rows(
+        [
+            {
+                "retrieval_metrics": strict_metrics,
+                "paper_metrics": paper_metrics,
+                "semantic_metrics": {},
+            }
+        ]
+    )
+
+    assert summary["Recall"] == 0.5
+    assert summary["Precision"] == 0.25
+    assert summary["MRR"] == 0.2
+    assert summary["NDCG"] == 0.3
+    assert summary["MAP"] == 0.4
 
 
 class FakeGraphStore:
@@ -245,6 +329,56 @@ class FakeGraphStore:
         if "MATCH (s:Section" in cypher:
             return [{"title": "Alpha", "content": "Graph parent text", "paragraph_id": "paragraph::alpha::0"}]
         return []
+
+
+class ExpansionGraphStore:
+    def __init__(self, content, sentences=None):
+        self.content = content
+        self.sentences = sentences or []
+        self.queries = []
+
+    def query(self, cypher, params=None):
+        self.queries.append((cypher, params or {}))
+        return [{"title": "Beta", "content": self.content, "sentences": self.sentences}]
+
+
+class ParentBySentenceGraphStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, params=None):
+        params = params or {}
+        self.queries.append((cypher, params))
+        if "target:Sentence" in cypher:
+            assert params["title"] == "Alpha"
+            assert params["sentence_id"] == "7"
+            return [
+                {
+                    "title": "Alpha",
+                    "content": "The exact parent paragraph for sentence seven.",
+                    "paragraph_id": "paragraph::alpha::2",
+                    "sentence_ids": ["6", "7", "8"],
+                }
+            ]
+        return []
+
+
+class StrictParentFallbackGraphStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, params=None):
+        self.queries.append((cypher, params or {}))
+        if "ORDER BY p.position" in cypher and "WITH s, p" not in cypher:
+            raise AssertionError("fallback parent lookup must order paragraphs before aggregating sentence ids")
+        return [
+            {
+                "title": "Alpha",
+                "content": "First parent paragraph.",
+                "paragraph_id": "paragraph::alpha::0",
+                "sentence_ids": ["0"],
+            }
+        ]
 
 
 def test_parent_map_uses_neo4j_structure_graph_not_json_fallback():
@@ -268,6 +402,91 @@ def test_parent_map_uses_neo4j_structure_graph_not_json_fallback():
     assert mapped[0].content == "Graph parent text"
     assert mapped[0].metadata["paragraph_id"] == "paragraph::alpha::0"
     assert runner.graph_store.queries
+
+
+def test_parent_map_fetches_parent_paragraph_containing_trigger_sentence():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = ParentBySentenceGraphStore()
+
+    mapped = runner.parent_map(
+        [
+            EvidenceUnit(
+                id="sent::alpha::7",
+                title="Alpha",
+                content="Trigger sentence.",
+                score=0.8,
+                is_sentence_level=True,
+                sentence_id="7",
+            )
+        ]
+    )
+
+    assert mapped[0].content == "The exact parent paragraph for sentence seven."
+    assert mapped[0].metadata["paragraph_id"] == "paragraph::alpha::2"
+    assert mapped[0].metadata["sentence_ids"] == ["6", "7", "8"]
+    assert mapped[0].metadata["trigger_sentence_ids"] == ["7"]
+
+
+def test_parent_lookup_fallback_orders_paragraphs_before_sentence_id_aggregation():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = StrictParentFallbackGraphStore()
+
+    parent = runner.fetch_parent_from_graph("Alpha")
+
+    assert parent["content"] == "First parent paragraph."
+    assert parent["sentence_ids"] == ["0"]
+
+
+def test_graph_expand_returns_query_focused_snippet_not_full_section_text():
+    content = (
+        "Opening noise unrelated to the question. "
+        "Alpha Beta bridge fact gives the useful evidence. "
+        "More unrelated background that should not be copied in full."
+    )
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = ExpansionGraphStore(content)
+
+    units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=5, query="Alpha Beta")
+
+    assert len(units) == 1
+    assert units[0].title == "Beta"
+    assert units[0].content == "Alpha Beta bridge fact gives the useful evidence."
+    assert units[0].content != content
+    assert runner.graph_store.queries[0][1]["limit"] == 5
+
+
+def test_graph_expand_tracks_selected_snippet_sentence_ids_for_support_metrics():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = ExpansionGraphStore(
+        content="Opening noise. Alpha Beta bridge fact gives the useful evidence. Closing noise.",
+        sentences=[
+            {"id": 0, "text": "Opening noise."},
+            {"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."},
+            {"id": 2, "text": "Closing noise."},
+        ],
+    )
+
+    units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=5, query="Alpha Beta")
+
+    assert units[0].content == "Alpha Beta bridge fact gives the useful evidence."
+    assert units[0].metadata["sentence_ids"] == ["1"]
+
+
+def test_graph_expand_deduplicates_repeated_sentence_rows_from_multiple_semantic_paths():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = ExpansionGraphStore(
+        content="Alpha Beta bridge fact gives the useful evidence. Closing noise.",
+        sentences=[
+            {"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."},
+            {"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."},
+            {"id": 2, "text": "Closing noise."},
+        ],
+    )
+
+    units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=5, query="Alpha Beta")
+
+    assert units[0].content == "Alpha Beta bridge fact gives the useful evidence."
+    assert units[0].metadata["sentence_ids"] == ["1"]
 
 
 def test_parent_map_aggregates_trigger_sentence_positions_for_same_parent():
@@ -332,25 +551,129 @@ def test_local_parent_route_keeps_initial_evidence_and_adds_parent_context():
     assert result.units[1].metadata["trigger_sentence_ids"] == ["0"]
 
 
-def test_fixed_graph_variant_uses_same_initial_sources_and_reranker_as_adaptive():
+def test_fixed_graph_variant_uses_shared_initial_candidates_and_fixed_broad_expansion():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     runner.graph_store = FakeGraphStore()
-    vector = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha founded Beta.", score=0.9)
-    keyword = EvidenceUnit(id="kw::beta", title="Beta", content="Beta keyword page.", score=0.6)
+    vectors = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
+        for idx in range(5)
+    ]
+    keywords = [
+        EvidenceUnit(id=f"kw::{idx}", title=f"Keyword {idx}", content=f"Keyword {idx} evidence.", score=0.5 - idx / 10)
+        for idx in range(2)
+    ]
     seen = {}
-    runner.vector_retrieve = lambda query, store_name, top_k=None: [vector]
-    runner.keyword_retrieve = lambda query, top_k=None: [keyword]
+    runner.vector_retrieve = lambda query, store_name, top_k=None: vectors
+    runner.keyword_retrieve = lambda query, top_k=None: keywords
 
     def fake_rerank(query, units, top_k=None):
         seen["ids"] = [unit.id for unit in units]
+        seen["top_k"] = top_k
         return list(units)
 
     runner.rerank_units = fake_rerank
-    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None: []
+
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True):
+        seen["titles"] = list(titles)
+        seen["hops"] = hops
+        seen["limit"] = limit_per_seed
+        seen["query"] = query
+        seen["use_snippet"] = use_snippet
+        return []
+
+    runner.graph_expand = fake_graph_expand
 
     runner.retrieve_fixed_graph("Alpha Beta", hops=1)
 
-    assert seen["ids"] == ["sent::alpha::0", "kw::beta"]
+    assert seen["ids"] == [unit.id for unit in vectors + keywords]
+    assert seen["top_k"] == runner.config.k3
+    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2", "Seed 3", "Seed 4", "Keyword 0", "Keyword 1"]
+    assert seen["hops"] == 1
+    assert seen["limit"] == runner.config.max_graph_neighbors
+    assert seen["query"] == "Alpha Beta"
+    assert seen["use_snippet"] is False
+
+
+def test_fixed_graph_variant_does_not_mix_in_parent_scale():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    seed = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha founded Beta.", score=0.9)
+    expanded = EvidenceUnit(id="graph::beta", title="Beta", content="Beta expanded.", score=0.5)
+    runner.vector_retrieve = lambda query, store_name, top_k=None: [seed]
+    runner.keyword_retrieve = lambda query, top_k=None: []
+    runner.rerank_units = lambda query, units, top_k=None: list(units)
+    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="", use_snippet=True: [expanded]
+    runner.parent_context_pool = lambda units: (_ for _ in ()).throw(
+        AssertionError("fixed graph variants should isolate graph expansion from parent scale")
+    )
+    runner.select_with_budget = lambda query, units, max_units=None: list(units)
+
+    result = runner.retrieve_fixed_graph("Alpha Beta", hops=1)
+
+    assert [unit.id for unit in result.units] == ["sent::alpha::0", "graph::beta"]
+
+
+def test_adaptive_graph_route_expands_the_full_reranked_b0_with_controlled_neighbor_limit():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    seeds = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
+        for idx in range(7)
+    ]
+    seen = {}
+    runner.vector_retrieve = lambda query, store_name, top_k=None: seeds
+    runner.keyword_retrieve = lambda query, top_k=None: []
+    runner.rerank_units = lambda query, units, top_k=None: list(units)
+    runner.choose_adaptive_route = lambda query, candidates: (
+        "graph_expansion",
+        {
+            "complexity_score": 0.9,
+            "complementarity": 0.2,
+            "route": "graph_expansion",
+        },
+    )
+
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True):
+        seen["titles"] = list(titles)
+        seen["limit"] = limit_per_seed
+        seen["query"] = query
+        seen["use_snippet"] = use_snippet
+        return []
+
+    runner.graph_expand = fake_graph_expand
+
+    runner.retrieve_adaptive("Alpha Beta bridge question")
+
+    assert seen["titles"] == ["Seed 0", "Seed 1", "Seed 2", "Seed 3", "Seed 4", "Seed 5", "Seed 6"]
+    assert seen["limit"] == 5
+    assert seen["query"] == "Alpha Beta bridge question"
+    assert seen["use_snippet"] is True
+
+
+def test_graphrag_baseline_uses_broad_full_text_graph_expansion():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    seeds = [
+        EvidenceUnit(id=f"sent::{idx}", title=f"Seed {idx}", content=f"Seed {idx} evidence.", score=1.0 - idx / 10)
+        for idx in range(7)
+    ]
+    seen = {}
+    runner.vector_retrieve = lambda query, store_name, top_k=None: seeds
+
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True):
+        seen["titles"] = list(titles)
+        seen["hops"] = hops
+        seen["limit"] = limit_per_seed
+        seen["seed_limit"] = seed_limit
+        seen["use_snippet"] = use_snippet
+        return []
+
+    runner.graph_expand = fake_graph_expand
+
+    runner.retrieve_graphrag("Alpha Beta")
+
+    assert seen["titles"] == [f"Seed {idx}" for idx in range(7)]
+    assert seen["hops"] == runner.config.hmax
+    assert seen["limit"] == runner.config.max_graph_neighbors
+    assert seen["seed_limit"] == runner.config.k3
+    assert seen["use_snippet"] is False
 
 
 def test_graph_route_summary_gate_counts_parent_and_expansion_not_initial_candidates():
@@ -377,7 +700,7 @@ def test_graph_route_summary_gate_counts_parent_and_expansion_not_initial_candid
             "route": "graph_expansion",
         },
     )
-    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None: []
+    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="": []
 
     def fake_summary(titles, query=""):
         called["titles"] = list(titles)
@@ -551,6 +874,51 @@ class QueryOnlyEmbeddingClient:
         return np.array([[1.0, 0.0]], dtype=np.float32)
 
 
+class VectorIndexGraphStore:
+    def __init__(self):
+        self.queries = []
+
+    def query(self, cypher, params=None):
+        self.queries.append((cypher, params or {}))
+        if "SHOW INDEXES" in cypher:
+            return [{"name": "sentence_embedding", "type": "VECTOR", "state": "ONLINE"}]
+        if "db.index.vector.queryNodes" in cypher:
+            raise AssertionError("Neo4j 2026 vector retrieval should use SEARCH, not deprecated queryNodes")
+        if "SEARCH node IN" in cypher and "VECTOR INDEX sentence_embedding" in cypher:
+            assert (params or {}).get("limit") == 1
+            assert list((params or {}).get("embedding")) == [1.0, 0.0]
+            return [
+                {
+                    "id": "sentence::alpha::0",
+                    "title": "Alpha",
+                    "content": "Alpha founded Beta.",
+                    "sent_id": 0,
+                    "paragraph_id": "paragraph::alpha::0",
+                    "score": 0.99,
+                }
+            ]
+        if "sent.embedding AS embedding" in cypher:
+            raise AssertionError("full graph embedding scan should not run when vector index answers")
+        return []
+
+
+def test_graph_semantic_retrieve_uses_neo4j_vector_index_without_full_embedding_scan():
+    runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
+    runner.graph_store = VectorIndexGraphStore()
+    runner.embedding_client = QueryOnlyEmbeddingClient()
+
+    units = runner.graph_semantic_retrieve("Alpha Beta", "sentence", top_k=1)
+
+    assert len(units) == 1
+    assert units[0].title == "Alpha"
+    assert units[0].score == 0.99
+    assert units[0].source == "graph_semantic_sentence"
+    assert units[0].metadata["section_source"] == "neo4j"
+    assert runner.embedding_client.calls == ["Alpha Beta"]
+    assert runner._graph_unit_cache == {}
+    assert runner._graph_embedding_cache == {}
+
+
 def test_graph_semantic_retrieve_uses_stored_neo4j_embeddings_before_encoding_text():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True))
     runner.graph_store = StoredEmbeddingGraphStore()
@@ -592,7 +960,7 @@ def test_vector_retrieve_uses_neo4j_paragraph_nodes_when_neo4j_required():
     assert units[0].metadata["section_source"] == "neo4j"
 
 
-def test_macrag_uses_fixed_multiscale_candidates_not_complexity_routing():
+def test_macrag_uses_sentence_and_paragraph_candidates_without_parent_context():
     runner = PaperExperimentRunner(RetrievalConfig())
     calls = []
 
@@ -614,12 +982,58 @@ def test_macrag_uses_fixed_multiscale_candidates_not_complexity_routing():
 
     runner.vector_retrieve = fake_vector_retrieve
     runner.rerank_units = fake_rerank
+    runner.parent_context_pool = lambda units: (_ for _ in ()).throw(
+        AssertionError("MacRAG baseline should not use proposed parent context")
+    )
+    runner.select_with_budget = lambda query, units, max_units=None: list(units)[:max_units]
 
     result = runner.retrieve_macrag("Which person founded Alpha?")
 
-    assert calls == [("sentence", runner.config.k1), ("paragraph", max(1, runner.config.k1 // 2))]
+    assert calls == [("sentence", runner.config.k1), ("paragraph", runner.config.k1 // 2)]
     assert result.stats["route"] == "macrag"
     assert [unit.title for unit in result.units] == ["Sentence Title", "Paragraph Title"]
+
+
+def test_fine_only_baseline_uses_shared_initial_candidates_without_parent():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    seed = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha evidence.", score=0.9)
+    keyword = EvidenceUnit(id="kw::beta", title="Beta", content="Beta title evidence.", score=0.6)
+    calls = []
+    runner.vector_retrieve = lambda query, store_name="sentence", top_k=None: calls.append((store_name, top_k)) or [seed]
+    runner.keyword_retrieve = lambda query, top_k=None: [keyword]
+    runner.parent_map = lambda units: (_ for _ in ()).throw(
+        AssertionError("fine-only baseline should not use parent mapping")
+    )
+    runner.rerank_units = lambda query, units, top_k=None: list(units)
+
+    result = runner.retrieve_fine_only("Alpha Beta")
+
+    assert calls == [("sentence", runner.config.k1)]
+    assert [unit.id for unit in result.units] == ["sent::alpha::0", "kw::beta"]
+    assert result.stats["route"] == "fine_only"
+
+
+def test_uniform_parent_baseline_maps_shared_initial_candidates():
+    runner = PaperExperimentRunner(RetrievalConfig())
+    seed = EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha evidence.", score=0.9)
+    keyword = EvidenceUnit(id="kw::beta", title="Beta", content="Beta title evidence.", score=0.6)
+    parent = EvidenceUnit(id="parent::Alpha", title="Alpha", content="Alpha parent.", score=0.9, granularity="paragraph")
+    calls = []
+    runner.vector_retrieve = lambda query, store_name="sentence", top_k=None: calls.append((store_name, top_k)) or [seed]
+    runner.keyword_retrieve = lambda query, top_k=None: [keyword]
+    runner.rerank_units = lambda query, units, top_k=None: list(units)
+
+    def fake_parent_map(units):
+        assert [unit.id for unit in units] == ["sent::alpha::0", "kw::beta"]
+        return [parent]
+
+    runner.parent_map = fake_parent_map
+
+    result = runner.retrieve_uniform_parent("Alpha Beta")
+
+    assert calls == [("sentence", runner.config.k1)]
+    assert [unit.id for unit in result.units] == ["parent::Alpha"]
+    assert result.stats["route"] == "parent_all"
 
 
 def test_graph_semantic_retrieve_embeds_neo4j_units_once_per_granularity():

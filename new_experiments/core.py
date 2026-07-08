@@ -54,6 +54,8 @@ class RetrievalConfig:
     parent_threshold: float = 0.60
     fragmentation_threshold: float = 0.65
     max_graph_neighbors: int = 10
+    graph_expansion_limit_per_seed: int = 5
+    graph_expansion_snippet_chars: int = 450
     max_context_units: int = 20
 
     run_generation: bool = True
@@ -408,8 +410,19 @@ def compute_support_fact_metrics(
 
         if unit.is_sentence_level and unit.sentence_id:
             covered = {(unit.title, str(unit.sentence_id))} & relevant
-        else:
+        elif unit.metadata.get("coverage") == "title":
             covered = {fact for fact in relevant if fact[0] == unit.title}
+        else:
+            sentence_ids = []
+            for key in ("sentence_ids", "trigger_sentence_ids", "section_sentence_ids"):
+                raw_ids = unit.metadata.get(key)
+                if raw_ids is None:
+                    continue
+                if isinstance(raw_ids, (str, int)):
+                    sentence_ids.append(str(raw_ids))
+                else:
+                    sentence_ids.extend(str(sent_id) for sent_id in raw_ids if sent_id is not None)
+            covered = {(unit.title, sent_id) for sent_id in sentence_ids} & relevant
         new_facts = covered - seen_facts
         unit_gains.append(len(new_facts))
         seen_facts.update(new_facts)
@@ -448,6 +461,30 @@ def compute_support_fact_metrics(
         time_ms=latency_ms,
         expanded_nodes=expanded_nodes,
         storage_mb=storage_mb,
+    )
+
+
+def compute_paper_table_metrics(
+    support_metrics: ExperimentMetrics,
+    title_ranking_metrics: ExperimentMetrics,
+) -> ExperimentMetrics:
+    """Paper tables use support-fact labels for retrieval quality metrics.
+
+    Keep title-level ranking metrics in details as diagnostics, but the paper
+    states that support-fact labels are used for Recall and related ranking
+    metrics, so summary tables must not swap in title-level MRR/NDCG/MAP.
+    """
+
+    return ExperimentMetrics(
+        recall=support_metrics.recall,
+        precision=support_metrics.precision,
+        mrr=support_metrics.mrr,
+        ndcg=support_metrics.ndcg,
+        map_score=support_metrics.map_score,
+        avg_len=support_metrics.avg_len,
+        time_ms=support_metrics.time_ms,
+        expanded_nodes=support_metrics.expanded_nodes,
+        storage_mb=support_metrics.storage_mb,
     )
 
 
@@ -521,6 +558,7 @@ class PaperExperimentRunner:
         self._graph_unit_cache: Dict[str, List[EvidenceUnit]] = {}
         self._graph_retrieve_cache: Dict[str, List[EvidenceUnit]] = {}
         self._graph_embedding_cache: Dict[str, np.ndarray] = {}
+        self._graph_vector_index_cache: Dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # 资源加载
@@ -657,14 +695,25 @@ class PaperExperimentRunner:
         if cache_key in self._graph_retrieve_cache:
             return self._graph_retrieve_cache[cache_key]
 
+        qv: Optional[np.ndarray] = None
+        if self.graph_vector_index_online(store_name):
+            qv = self.embedding_client.embed(query)
+            if len(qv.shape) == 2:
+                qv = qv[0]
+            indexed_result = self.query_graph_vector_index(store_name, limit, qv)
+            if indexed_result:
+                self._graph_retrieve_cache[cache_key] = indexed_result
+                return indexed_result
+
         candidates = self.load_graph_evidence_units(store_name)
         if not candidates:
             return []
 
         candidate_embeddings = self.load_graph_evidence_embeddings(store_name)
-        qv = self.embedding_client.embed(query)
-        if len(qv.shape) == 2:
-            qv = qv[0]
+        if qv is None:
+            qv = self.embedding_client.embed(query)
+            if len(qv.shape) == 2:
+                qv = qv[0]
         scores = np.dot(candidate_embeddings, qv)
         scored: List[Tuple[float, EvidenceUnit]] = []
         for score, unit in zip(scores, candidates):
@@ -688,6 +737,145 @@ class PaperExperimentRunner:
         result = [unit for _, unit in scored[:limit]]
         self._graph_retrieve_cache[cache_key] = result
         return result
+
+    def query_graph_vector_index(self, store_name: str, limit: int, query_embedding: np.ndarray) -> List[EvidenceUnit]:
+        if self.graph_store is None:
+            return []
+
+        index_name = self.graph_vector_index_name(store_name)
+        if not index_name or not self.graph_vector_index_online(store_name):
+            return []
+
+        embedding = [float(value) for value in np.asarray(query_embedding, dtype=np.float32).tolist()]
+        params = {"limit": int(limit), "embedding": embedding}
+        if store_name == "sentence":
+            cypher = f"""
+            MATCH (node:Sentence)
+            SEARCH node IN (
+              VECTOR INDEX {index_name}
+              FOR $embedding
+              LIMIT $limit
+            ) SCORE AS score
+            MATCH (sec:Section)-[:HAS_PARAGRAPH]->(p:Paragraph)-[:HAS_SENTENCE]->(node)
+            RETURN node.id AS id,
+                   sec.title AS title,
+                   node.text AS content,
+                   node.sent_id AS sent_id,
+                   p.id AS paragraph_id,
+                   score AS score
+            ORDER BY score DESC
+            """
+        else:
+            cypher = f"""
+            MATCH (node:Paragraph)
+            SEARCH node IN (
+              VECTOR INDEX {index_name}
+              FOR $embedding
+              LIMIT $limit
+            ) SCORE AS score
+            MATCH (sec:Section)-[:HAS_PARAGRAPH]->(node)
+            OPTIONAL MATCH (node)-[:HAS_SENTENCE]->(sent:Sentence)
+            RETURN node.id AS id,
+                   sec.title AS title,
+                   node.text AS content,
+                   node.position AS position,
+                   collect(toString(sent.sent_id)) AS sentence_ids,
+                   score AS score
+            ORDER BY score DESC
+            """
+
+        try:
+            rows = self.graph_store.query(cypher, params)
+        except Exception as exc:
+            logger.warning("Neo4j vector index retrieval failed for %s: %s", store_name, exc)
+            self._graph_vector_index_cache[store_name] = False
+            return []
+
+        units: List[EvidenceUnit] = []
+        for row in rows:
+            title = str(row.get("title") or "")
+            content = str(row.get("content") or "")
+            if not title or not content:
+                continue
+            if store_name == "sentence":
+                sent_id = row.get("sent_id")
+                units.append(
+                    EvidenceUnit(
+                        id=str(row.get("id") or f"sentence::{title}::{sent_id}"),
+                        title=title,
+                        content=content,
+                        score=float(row.get("score") or 0.0),
+                        source="graph_semantic_sentence",
+                        granularity="sentence",
+                        is_sentence_level=True,
+                        sentence_id=str(sent_id if sent_id is not None else ""),
+                        metadata={
+                            "paragraph_id": str(row.get("paragraph_id") or ""),
+                            "section_source": "neo4j",
+                            "vector_index": index_name,
+                        },
+                    )
+                )
+            else:
+                units.append(
+                    EvidenceUnit(
+                        id=str(row.get("id") or f"paragraph::{title}"),
+                        title=title,
+                        content=content,
+                        score=float(row.get("score") or 0.0),
+                        source="graph_semantic_paragraph",
+                        granularity="paragraph",
+                        metadata={
+                            "paragraph_id": str(row.get("id") or ""),
+                            "position": row.get("position"),
+                            "section_source": "neo4j",
+                            "vector_index": index_name,
+                            "sentence_ids": [str(sent_id) for sent_id in row.get("sentence_ids", []) if sent_id is not None],
+                        },
+                    )
+                )
+        return units
+
+    @staticmethod
+    def graph_vector_index_name(store_name: str) -> str:
+        if store_name == "sentence":
+            return "sentence_embedding"
+        if store_name == "paragraph":
+            return "paragraph_embedding"
+        return ""
+
+    def graph_vector_index_online(self, store_name: str) -> bool:
+        if store_name in self._graph_vector_index_cache:
+            return self._graph_vector_index_cache[store_name]
+        if self.graph_store is None:
+            return False
+
+        index_name = self.graph_vector_index_name(store_name)
+        if not index_name:
+            self._graph_vector_index_cache[store_name] = False
+            return False
+
+        cypher = """
+        SHOW INDEXES
+        YIELD name, type, state
+        WHERE name = $index_name
+        RETURN name, type, state
+        """
+        try:
+            rows = self.graph_store.query(cypher, {"index_name": index_name})
+        except Exception as exc:
+            logger.debug("Neo4j vector index status unavailable for %s: %s", store_name, exc)
+            self._graph_vector_index_cache[store_name] = False
+            return False
+
+        online = any(
+            str(row.get("name")) == index_name
+            and str(row.get("type", "")).upper() == "VECTOR"
+            and str(row.get("state", "")).upper() == "ONLINE"
+            for row in rows
+        )
+        self._graph_vector_index_cache[store_name] = online
+        return online
 
     def load_graph_evidence_embeddings(self, store_name: str) -> np.ndarray:
         if store_name in self._graph_embedding_cache:
@@ -781,10 +969,12 @@ class PaperExperimentRunner:
         else:
             cypher = """
             MATCH (sec:Section)-[:HAS_PARAGRAPH]->(p:Paragraph)
+            OPTIONAL MATCH (p)-[:HAS_SENTENCE]->(sent:Sentence)
             RETURN p.id AS id,
                    sec.title AS title,
                    p.text AS content,
                    p.position AS position,
+                   collect(toString(sent.sent_id)) AS sentence_ids,
                    p.embedding AS embedding
             ORDER BY sec.title, p.position
             """
@@ -802,6 +992,7 @@ class PaperExperimentRunner:
                         "position": row.get("position"),
                         "section_source": "neo4j",
                         "graph_embedding": row.get("embedding"),
+                        "sentence_ids": [str(sent_id) for sent_id in row.get("sentence_ids", []) if sent_id is not None],
                     },
                 )
                 for row in rows
@@ -842,6 +1033,7 @@ class PaperExperimentRunner:
                         score=0.65,
                         source="keyword_graph",
                         granularity="paragraph",
+                        metadata={"coverage": "title"},
                     )
                 )
         return unique_by_title(units)
@@ -896,7 +1088,11 @@ class PaperExperimentRunner:
     def parent_map(self, units: Sequence[EvidenceUnit]) -> List[EvidenceUnit]:
         mapped: Dict[Tuple[str, str, str], EvidenceUnit] = {}
         for unit in units:
-            graph_parent = self.fetch_parent_from_graph(unit.title)
+            graph_parent = self.fetch_parent_from_graph(
+                unit.title,
+                paragraph_id=str(unit.metadata.get("paragraph_id") or ""),
+                sentence_id=unit.sentence_id,
+            )
             if graph_parent:
                 full = graph_parent.get("content")
             elif self.config.require_neo4j:
@@ -917,6 +1113,7 @@ class PaperExperimentRunner:
                             "parent_of": unit.id,
                             "paragraph_id": graph_parent.get("paragraph_id") if graph_parent else "",
                             "section_source": "neo4j" if graph_parent else "json_fallback",
+                            "sentence_ids": graph_parent.get("sentence_ids", []) if graph_parent else [],
                             "trigger_unit_ids": [unit.id],
                             "trigger_sentence_ids": [unit.sentence_id] if unit.sentence_id else [],
                         },
@@ -939,21 +1136,54 @@ class PaperExperimentRunner:
         ]
         return list(units) + parents
 
-    def fetch_parent_from_graph(self, title: str) -> Optional[Dict[str, Any]]:
+    def fetch_parent_from_graph(
+        self,
+        title: str,
+        paragraph_id: str = "",
+        sentence_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
         if self.graph_store is None or not title:
             return None
 
-        cypher = """
-        MATCH (s:Section {title: $title})
-        OPTIONAL MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
-        RETURN s.title AS title,
-               coalesce(p.text, s.sentence_total) AS content,
-               p.id AS paragraph_id
-        ORDER BY p.position
-        LIMIT 1
-        """
+        params: Dict[str, Any] = {"title": title}
+        if paragraph_id:
+            cypher = """
+            MATCH (s:Section {title: $title})-[:HAS_PARAGRAPH]->(p:Paragraph {id: $paragraph_id})
+            OPTIONAL MATCH (p)-[:HAS_SENTENCE]->(sent:Sentence)
+            RETURN s.title AS title,
+                   p.text AS content,
+                   p.id AS paragraph_id,
+                   collect(toString(sent.sent_id)) AS sentence_ids
+            LIMIT 1
+            """
+            params["paragraph_id"] = paragraph_id
+        elif sentence_id:
+            cypher = """
+            MATCH (s:Section {title: $title})-[:HAS_PARAGRAPH]->(p:Paragraph)-[:HAS_SENTENCE]->(target:Sentence)
+            WHERE toString(target.sent_id) = toString($sentence_id)
+            OPTIONAL MATCH (p)-[:HAS_SENTENCE]->(sent:Sentence)
+            RETURN s.title AS title,
+                   p.text AS content,
+                   p.id AS paragraph_id,
+                   collect(toString(sent.sent_id)) AS sentence_ids
+            LIMIT 1
+            """
+            params["sentence_id"] = str(sentence_id)
+        else:
+            cypher = """
+            MATCH (s:Section {title: $title})
+            OPTIONAL MATCH (s)-[:HAS_PARAGRAPH]->(p:Paragraph)
+            WITH s, p
+            ORDER BY p.position
+            OPTIONAL MATCH (p)-[:HAS_SENTENCE]->(sent:Sentence)
+            RETURN s.title AS title,
+                   coalesce(p.text, s.sentence_total) AS content,
+                   p.id AS paragraph_id,
+                   collect(toString(sent.sent_id)) AS sentence_ids
+            LIMIT 1
+            """
         try:
-            rows = self.graph_store.query(cypher, {"title": title})
+            rows = self.graph_store.query(cypher, params)
         except Exception as exc:
             logger.warning("Parent lookup from graph failed for %s: %s", title, exc)
             return None
@@ -966,16 +1196,27 @@ class PaperExperimentRunner:
             "title": str(rows[0].get("title") or title),
             "content": content,
             "paragraph_id": str(rows[0].get("paragraph_id") or ""),
+            "sentence_ids": [str(sent_id) for sent_id in rows[0].get("sentence_ids", []) if sent_id is not None],
         }
 
-    def graph_expand(self, seed_titles: Sequence[str], hops: int = 1, limit_per_seed: Optional[int] = None) -> List[EvidenceUnit]:
+    def graph_expand(
+        self,
+        seed_titles: Sequence[str],
+        hops: int = 1,
+        limit_per_seed: Optional[int] = None,
+        query: str = "",
+        seed_limit: Optional[int] = None,
+        use_snippet: bool = True,
+    ) -> List[EvidenceUnit]:
         if self.graph_store is None:
             return []
 
         hops = max(1, min(int(hops), self.config.hmax))
-        limit = limit_per_seed or self.config.max_graph_neighbors
+        limit = limit_per_seed or self.config.graph_expansion_limit_per_seed
         max_degree = 500
         expanded: List[EvidenceUnit] = []
+        seed_cap = seed_limit if seed_limit is not None else self.config.k3
+        seed_titles = list(seed_titles)[: int(seed_cap)]
         seen = set(seed_titles)
 
         for title in seed_titles:
@@ -986,7 +1227,9 @@ class PaperExperimentRunner:
             MATCH (last)<-[:SEMANTIC_LINKS]-(n:Section)
             WHERE n <> start
               AND ALL(x IN nodes(p) WHERE COUNT {{ (x)--() }} <= $max_degree)
-            RETURN DISTINCT n.title AS title, n.sentence_total AS content
+            OPTIONAL MATCH (n)-[:HAS_PARAGRAPH]->(:Paragraph)-[:HAS_SENTENCE]->(sent:Sentence)
+            WITH n, collect({{id: toString(sent.sent_id), text: sent.text}}) AS sentences
+            RETURN DISTINCT n.title AS title, n.sentence_total AS content, sentences
             LIMIT $limit
             """
             try:
@@ -1000,7 +1243,27 @@ class PaperExperimentRunner:
 
             for row in rows:
                 new_title = str(row.get("title", "")).strip('"')
-                content = str(row.get("content", "") or self.title_to_content.get(new_title, ""))
+                raw_content = str(row.get("content", "") or self.title_to_content.get(new_title, ""))
+                sentence_rows = row.get("sentences", [])
+                metadata: Dict[str, Any]
+                if use_snippet:
+                    content, sentence_ids = self.extract_graph_evidence_snippet_with_ids(
+                        raw_content,
+                        query,
+                        sentence_rows,
+                    )
+                    metadata = {
+                        "snippet_source": "semantic_expansion",
+                        "sentence_ids": sentence_ids,
+                    }
+                else:
+                    content = raw_content.strip()
+                    sentence_ids = self.sentence_ids_from_rows(sentence_rows)
+                    metadata = {
+                        "snippet_source": "full_graph_expansion",
+                        "sentence_ids": sentence_ids,
+                        "coverage": "title",
+                    }
                 if new_title and content and new_title not in seen:
                     seen.add(new_title)
                     expanded.append(
@@ -1011,9 +1274,85 @@ class PaperExperimentRunner:
                             score=0.55,
                             source=f"graph_{hops}hop",
                             granularity="paragraph",
+                            metadata=metadata,
                         )
                     )
         return expanded
+
+    def graph_seed_titles(self, units: Sequence[EvidenceUnit]) -> List[str]:
+        return [unit.title for unit in list(units)[: self.config.k3]]
+
+    @staticmethod
+    def sentence_ids_from_rows(sentence_rows: Optional[Sequence[Dict[str, Any]]]) -> List[str]:
+        ids: List[str] = []
+        seen: Set[str] = set()
+        for row in sentence_rows or []:
+            if not isinstance(row, dict):
+                continue
+            raw_id = row.get("id") if row.get("id") is not None else row.get("sent_id")
+            if raw_id is None:
+                continue
+            sent_id = str(raw_id)
+            if sent_id and sent_id not in seen:
+                seen.add(sent_id)
+                ids.append(sent_id)
+        return ids
+
+    def extract_graph_evidence_snippet(self, content: str, query: str = "") -> str:
+        return self.extract_graph_evidence_snippet_with_ids(content, query)[0]
+
+    def extract_graph_evidence_snippet_with_ids(
+        self,
+        content: str,
+        query: str = "",
+        sentence_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> Tuple[str, List[str]]:
+        content = str(content or "").strip()
+        if not content:
+            return "", []
+
+        max_chars = max(1, int(self.config.graph_expansion_snippet_chars))
+        sentence_items: List[Tuple[int, str, str]] = []
+        if sentence_rows:
+            seen_sentence_rows: Set[Tuple[str, str]] = set()
+            for index, row in enumerate(sentence_rows):
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("text") or row.get("content") or "").strip()
+                sent_id = str(row.get("id") if row.get("id") is not None else row.get("sent_id", ""))
+                key = (sent_id, text)
+                if text and key not in seen_sentence_rows:
+                    seen_sentence_rows.add(key)
+                    sentence_items.append((index, sent_id, text))
+
+        if not sentence_items:
+            sentence_items = [
+                (index, "", sent.strip())
+                for index, sent in enumerate(re.split(r"(?<=[.!?])\s+", content))
+                if sent.strip()
+            ]
+
+        if not sentence_items:
+            return content[:max_chars].strip(), []
+
+        query_terms = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", query))
+        if query_terms:
+            scored: List[Tuple[int, int, int, str, str]] = []
+            for index, sent_id, sentence in sentence_items:
+                terms = set(t.lower() for t in re.findall(r"[A-Za-z0-9]+", sentence))
+                overlap = len(query_terms & terms)
+                if overlap:
+                    scored.append((-overlap, len(sentence), index, sent_id, sentence))
+            if scored:
+                selected = sorted(scored)[:3]
+                snippet = " ".join(item[4] for item in selected)[:max_chars].strip()
+                ids = [item[3] for item in selected if item[3]]
+                return snippet, ids
+
+        selected_items = sentence_items[:2]
+        snippet = " ".join(item[2] for item in selected_items)[:max_chars].strip()
+        ids = [item[1] for item in selected_items if item[1]]
+        return snippet, ids
 
     def add_summary_evidence(self, seed_titles: Sequence[str], query: str = "") -> List[EvidenceUnit]:
         """提取关键句子作为摘要证据
@@ -1134,10 +1473,22 @@ class PaperExperimentRunner:
         units = unique_by_title(self.rerank_units(query, candidates, self.config.k3))
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="rerank"))
 
+    def initial_reranked_candidates(self, query: str) -> List[EvidenceUnit]:
+        initial = self.vector_retrieve(query, "sentence", self.config.k1) + self.keyword_retrieve(query, self.config.k2)
+        initial = unique_by_title(initial, keep_content_distinct=True)
+        return self.rerank_units(query, initial, self.config.k3)
+
     def retrieve_graphrag(self, query: str) -> MethodResult:
         start = time.perf_counter()
         seeds = unique_by_title(self.vector_retrieve(query, "sentence", self.config.k1))[: self.config.k3]
-        expanded = self.graph_expand([u.title for u in seeds], hops=self.config.hmax)
+        expanded = self.graph_expand(
+            [u.title for u in seeds],
+            hops=self.config.hmax,
+            limit_per_seed=self.config.max_graph_neighbors,
+            query=query,
+            seed_limit=self.config.k3,
+            use_snippet=False,
+        )
         units = self.select_with_budget(query, list(seeds) + expanded)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route="graphrag"))
 
@@ -1146,17 +1497,37 @@ class PaperExperimentRunner:
         vector_units = self.vector_retrieve(query, "sentence", self.config.k1)
         keyword_units = self.keyword_retrieve(query, self.config.k2)
         seeds = self.rerank_units(query, vector_units + keyword_units, self.config.k3)
-        expanded = self.graph_expand([u.title for u in seeds], hops=1)
-        units = self.select_with_budget(query, seeds + expanded, max_units=self.config.k3 + self.config.max_graph_neighbors)
+        expanded = self.graph_expand(
+            self.graph_seed_titles(seeds),
+            hops=1,
+            limit_per_seed=self.config.graph_expansion_limit_per_seed,
+            query=query,
+        )
+        units = self.select_with_budget(
+            query,
+            seeds + expanded,
+            max_units=self.config.k3 + self.config.k3 * self.config.graph_expansion_limit_per_seed,
+        )
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route="kg_rag"))
 
     def retrieve_macrag(self, query: str) -> MethodResult:
         start = time.perf_counter()
         sent = self.vector_retrieve(query, "sentence", self.config.k1)
         para = self.vector_retrieve(query, "paragraph", max(1, self.config.k1 // 2))
-        units = self.rerank_units(query, sent + para, self.config.k3)
-        units = self.select_with_budget(query, units, max_units=self.config.k3)
+        seeds = self.rerank_units(query, sent + para, self.config.k3)
+        units = self.select_with_budget(query, seeds, max_units=self.config.k3)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="macrag"))
+
+    def retrieve_fine_only(self, query: str) -> MethodResult:
+        start = time.perf_counter()
+        units = unique_by_title(self.initial_reranked_candidates(query))[: self.config.k3]
+        return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="fine_only"))
+
+    def retrieve_uniform_parent(self, query: str) -> MethodResult:
+        start = time.perf_counter()
+        seeds = self.initial_reranked_candidates(query)
+        units = self.parent_map(seeds)
+        return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="parent_all"))
 
     def retrieve_adaptive(
         self,
@@ -1168,14 +1539,11 @@ class PaperExperimentRunner:
         force_parent: bool = False,
         fine_only: bool = False,
     ) -> MethodResult:
-        start = time.perf_counter()
-        initial = self.vector_retrieve(query, "sentence", self.config.k1) + self.keyword_retrieve(query, self.config.k2)
-        initial = unique_by_title(initial, keep_content_distinct=True)
-        reranked = self.rerank_units(query, initial, self.config.k3)
-
         if fine_only:
-            units = unique_by_title(reranked)[: self.config.k3]
-            return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=0, route="fine_only"))
+            return self.retrieve_fine_only(query)
+
+        start = time.perf_counter()
+        reranked = self.initial_reranked_candidates(query)
 
         if force_parent and enable_parent:
             units = self.parent_map(reranked)
@@ -1198,7 +1566,12 @@ class PaperExperimentRunner:
             summary_seed_units = parent_units or list(reranked)
             hops = forced_hops or self._dynamic_hops(route_detail)
             if enable_graph_expansion:
-                expanded = self.graph_expand([u.title for u in reranked], hops=hops)
+                expanded = self.graph_expand(
+                    self.graph_seed_titles(reranked),
+                    hops=hops,
+                    limit_per_seed=self.config.graph_expansion_limit_per_seed,
+                    query=query,
+                )
             
             all_candidates = list(reranked) + parent_units + expanded
             current_tokens = sum(estimate_tokens(u.content) for u in parent_units + expanded)
@@ -1217,11 +1590,15 @@ class PaperExperimentRunner:
 
     def retrieve_fixed_graph(self, query: str, hops: int) -> MethodResult:
         start = time.perf_counter()
-        initial = self.vector_retrieve(query, "sentence", self.config.k1) + self.keyword_retrieve(query, self.config.k2)
-        initial = unique_by_title(initial, keep_content_distinct=True)
-        seeds = self.rerank_units(query, initial, self.config.k3)
-        expanded = self.graph_expand([u.title for u in seeds], hops=hops)
-        units = self.select_with_budget(query, self.parent_context_pool(seeds) + expanded)
+        seeds = self.initial_reranked_candidates(query)
+        expanded = self.graph_expand(
+            self.graph_seed_titles(seeds),
+            hops=hops,
+            limit_per_seed=self.config.max_graph_neighbors,
+            query=query,
+            use_snippet=False,
+        )
+        units = self.select_with_budget(query, list(seeds) + expanded)
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route=f"fixed_{hops}hop"))
 
     def choose_adaptive_route(self, query: str, candidates: Sequence[EvidenceUnit]) -> Tuple[str, Dict[str, Any]]:
@@ -1481,8 +1858,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
         self.write_csv(run_dir / "table7_semantic_records.csv", self.semantic_record_table(method_rows))
 
         fixed_fns: Dict[str, Callable[[str], MethodResult]] = {
-            "Fine only": lambda q: self.retrieve_adaptive(q, fine_only=True),
-            "Uniform parent": lambda q: self.retrieve_adaptive(q, force_parent=True),
+            "Fine only": self.retrieve_fine_only,
+            "Uniform parent": self.retrieve_uniform_parent,
             "Fixed 1-hop": lambda q: self.retrieve_fixed_graph(q, hops=1),
             "Fixed 2-hop": lambda q: self.retrieve_fixed_graph(q, hops=2),
             "Proposed": lambda q: self.retrieve_adaptive(q),
@@ -1580,6 +1957,15 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                 latency_ms=method_result.stats.get("time_ms", 0.0),
                 expanded_nodes=method_result.stats.get("expanded_nodes", 0),
             )
+            title_metrics = compute_retrieval_metrics(
+                retrieved_titles=retrieved_titles,
+                relevant_titles=relevant_titles,
+                avg_context_len=metrics.avg_len,
+                latency_ms=metrics.time_ms,
+                expanded_nodes=metrics.expanded_nodes,
+                storage_mb=metrics.storage_mb,
+            )
+            paper_metrics = compute_paper_table_metrics(metrics, title_metrics)
 
             answer = self.generate_answer(question, method_result.units)
             semantic = self.judge_answer(question, ground_truth, answer, method_result.units)
@@ -1597,6 +1983,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                 "retrieved_contexts": [u.content for u in method_result.units],
                 "generated_answer": answer,
                 "retrieval_metrics": metrics,
+                "title_ranking_metrics": title_metrics,
+                "paper_metrics": paper_metrics,
                 "semantic_metrics": semantic,
                 "stats": method_result.stats,
                 "complexity_score": complexity_score,
@@ -1673,6 +2061,15 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                     latency_ms=method_result.stats.get("time_ms", 0.0),
                     expanded_nodes=method_result.stats.get("expanded_nodes", 0),
                 )
+                title_metrics = compute_retrieval_metrics(
+                    retrieved_titles=retrieved_titles,
+                    relevant_titles=relevant_titles,
+                    avg_context_len=metrics.avg_len,
+                    latency_ms=metrics.time_ms,
+                    expanded_nodes=metrics.expanded_nodes,
+                    storage_mb=metrics.storage_mb,
+                )
+                paper_metrics = compute_paper_table_metrics(metrics, title_metrics)
                 route_detail = method_result.stats.get("route_detail", {})
                 complexity_score = route_detail.get("complexity_score", self.complexity_scorer.compute(question).score)
                 result = {
@@ -1686,6 +2083,8 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
                     "retrieved_contexts": [u.content for u in method_result.units],
                     "generated_answer": "",
                     "retrieval_metrics": metrics,
+                    "title_ranking_metrics": title_metrics,
+                    "paper_metrics": paper_metrics,
                     "semantic_metrics": {},
                     "stats": method_result.stats,
                     "complexity_score": complexity_score,
@@ -1746,6 +2145,10 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
             "context_relevance": round2(mean_or_none(s.get("context_relevance") for s in semantic)),
         }
 
+    @staticmethod
+    def _summary_metrics(row: Dict[str, Any]) -> ExperimentMetrics:
+        return row["retrieval_metrics"]
+
     def semantic_record_table(self, rows_by_method: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
         table = []
         for method, rows in rows_by_method.items():
@@ -1771,7 +2174,7 @@ Return only JSON with keys correctness, faithfulness, answer_relevance, context_
 
         out = []
         for level, rows in buckets.items():
-            metrics = [row["retrieval_metrics"] for row in rows]
+            metrics = [self._summary_metrics(row) for row in rows]
             graph_count = sum(1 for row in rows if row.get("route") == "graph_expansion")
             out.append(
                 {

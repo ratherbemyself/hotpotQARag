@@ -354,6 +354,24 @@ class MultiExpansionGraphStore:
         return self.rows[:limit]
 
 
+class GraphGateReranker:
+    def __init__(self):
+        self.calls = []
+
+    def rerank(self, query, candidates, top_k=None):
+        self.calls.append((query, candidates, top_k))
+        candidates = sorted(
+            candidates,
+            key=lambda candidate: (
+                "strong bridge" not in candidate.content,
+                candidate.content,
+            ),
+        )
+        for index, candidate in enumerate(candidates):
+            candidate.score = float(len(candidates) - index)
+        return candidates[:top_k] if top_k is not None else candidates
+
+
 class ParentBySentenceGraphStore:
     def __init__(self):
         self.queries = []
@@ -464,7 +482,7 @@ def test_graph_expand_returns_query_focused_snippet_not_full_section_text():
     assert units[0].title == "Beta"
     assert units[0].content == "Alpha Beta bridge fact gives the useful evidence."
     assert units[0].content != content
-    assert runner.graph_store.queries[0][1]["limit"] == 5
+    assert runner.graph_store.queries[0][1]["limit"] == runner.config.max_graph_neighbors
 
 
 def test_graph_expand_tracks_selected_snippet_sentence_ids_for_support_metrics():
@@ -501,7 +519,7 @@ def test_graph_expand_deduplicates_repeated_sentence_rows_from_multiple_semantic
     assert units[0].metadata["sentence_ids"] == ["1"]
 
 
-def test_graph_expand_honors_explicit_neighbor_limit_without_overfetching():
+def test_graph_expand_uses_candidate_pool_before_final_gate_limit():
     runner = PaperExperimentRunner(RetrievalConfig(require_neo4j=True, max_graph_neighbors=3))
     runner.graph_store = MultiExpansionGraphStore(
         [
@@ -509,19 +527,230 @@ def test_graph_expand_honors_explicit_neighbor_limit_without_overfetching():
                 "title": "Noise",
                 "content": "Unrelated page about geography.",
                 "sentences": [{"id": 0, "text": "Unrelated page about geography."}],
+                "path_entities": [["Common"]],
             },
             {
                 "title": "Beta",
                 "content": "Alpha Beta bridge fact gives the useful evidence.",
                 "sentences": [{"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."}],
+                "path_entities": [["Alpha", "Beta"]],
             },
         ]
     )
 
     units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=1, query="Alpha Beta")
 
+    assert [unit.title for unit in units] == ["Beta"]
+    assert runner.graph_store.queries[0][1]["limit"] == 3
+
+
+def test_graph_expand_overfetches_then_filters_noise_before_final_limit():
+    runner = PaperExperimentRunner(
+        RetrievalConfig(
+            require_neo4j=True,
+            max_graph_neighbors=4,
+            graph_expansion_limit_per_seed=1,
+        )
+    )
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": "Noise",
+                "content": "Unrelated page about geography.",
+                "sentences": [{"id": 0, "text": "Unrelated page about geography."}],
+                "path_entities": [["Common"]],
+            },
+            {
+                "title": "Beta",
+                "content": "Beta collaborated with Alpha on the bridge project.",
+                "sentences": [{"id": 1, "text": "Beta collaborated with Alpha on the bridge project."}],
+                "path_entities": [["Alpha", "Beta"]],
+            },
+        ]
+    )
+    seed = EvidenceUnit(
+        id="sent::alpha::0",
+        title="Alpha",
+        content="Alpha collaborated with an unnamed partner.",
+        score=0.9,
+        is_sentence_level=True,
+    )
+
+    units = runner.graph_expand(
+        ["Alpha"],
+        hops=1,
+        limit_per_seed=1,
+        query="Who collaborated with Alpha?",
+        seed_units=[seed],
+    )
+
+    assert [unit.title for unit in units] == ["Beta"]
+    assert runner.graph_store.queries[0][1]["limit"] == 4
+    assert units[0].metadata["graph_gate"]["decision"] == "kept"
+    assert units[0].metadata["graph_gate"]["path_entity_overlap"] > 0
+
+
+def test_graph_expand_reranks_filtered_candidates_with_seed_context():
+    runner = PaperExperimentRunner(
+        RetrievalConfig(
+            require_neo4j=True,
+            max_graph_neighbors=4,
+            graph_expansion_limit_per_seed=2,
+        )
+    )
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": "Weak",
+                "content": "Weak bridge mentions Alpha but lacks the decisive relation.",
+                "sentences": [{"id": 0, "text": "Weak bridge mentions Alpha but lacks the decisive relation."}],
+                "path_entities": [["Alpha", "Weak"]],
+            },
+            {
+                "title": "Strong",
+                "content": "Strong bridge evidence says Alpha collaborated with Beta.",
+                "sentences": [{"id": 1, "text": "Strong bridge evidence says Alpha collaborated with Beta."}],
+                "path_entities": [["Alpha", "Strong"]],
+            },
+        ]
+    )
+    reranker = GraphGateReranker()
+    runner.reranker = reranker
+    seed = EvidenceUnit(
+        id="sent::alpha::0",
+        title="Alpha",
+        content="Alpha collaborated with someone in the archive.",
+        score=0.9,
+        is_sentence_level=True,
+    )
+
+    units = runner.graph_expand(
+        ["Alpha"],
+        hops=1,
+        limit_per_seed=2,
+        query="Who collaborated with Alpha?",
+        seed_units=[seed],
+    )
+
+    assert [unit.title for unit in units] == ["Strong", "Weak"]
+    assert "Initial evidence" in reranker.calls[0][0]
+    assert "Alpha collaborated with someone" in reranker.calls[0][0]
+    assert reranker.calls[0][2] == 2
+
+
+def test_graph_expand_reranks_all_seed_candidates_in_one_global_pass():
+    runner = PaperExperimentRunner(
+        RetrievalConfig(
+            require_neo4j=True,
+            max_graph_neighbors=2,
+            graph_expansion_limit_per_seed=1,
+        )
+    )
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": "Weak",
+                "content": "Weak bridge mentions Alpha but lacks the decisive relation.",
+                "sentences": [{"id": 0, "text": "Weak bridge mentions Alpha but lacks the decisive relation."}],
+                "path_entities": [["Alpha", "Weak"]],
+            },
+            {
+                "title": "Strong",
+                "content": "Strong bridge evidence says Alpha collaborated with Beta.",
+                "sentences": [{"id": 1, "text": "Strong bridge evidence says Alpha collaborated with Beta."}],
+                "path_entities": [["Beta", "Strong"]],
+            },
+        ]
+    )
+    reranker = GraphGateReranker()
+    runner.reranker = reranker
+    seeds = [
+        EvidenceUnit(id="sent::alpha::0", title="Alpha", content="Alpha has a weak lead.", score=0.9),
+        EvidenceUnit(id="sent::beta::0", title="Beta", content="Beta has a strong bridge clue.", score=0.8),
+    ]
+
+    units = runner.graph_expand(
+        ["Alpha", "Beta"],
+        hops=1,
+        limit_per_seed=1,
+        query="Who collaborated with Alpha and Beta?",
+        seed_units=seeds,
+    )
+
+    assert len(reranker.calls) == 1
+    assert reranker.calls[0][2] == 2
+    assert [unit.title for unit in units] == ["Strong", "Weak"]
+
+
+def test_graph_expand_source_mode_uses_exact_limit_and_skips_gate_rerank():
+    runner = PaperExperimentRunner(
+        RetrievalConfig(
+            require_neo4j=True,
+            max_graph_neighbors=4,
+            graph_expansion_limit_per_seed=1,
+        )
+    )
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": "Noise",
+                "content": "Unrelated page about geography.",
+                "sentences": [{"id": 0, "text": "Unrelated page about geography."}],
+                "path_entities": [["Common"]],
+            },
+            {
+                "title": "Beta",
+                "content": "Alpha Beta bridge fact gives the useful evidence.",
+                "sentences": [{"id": 1, "text": "Alpha Beta bridge fact gives the useful evidence."}],
+                "path_entities": [["Alpha", "Beta"]],
+            },
+        ]
+    )
+    reranker = GraphGateReranker()
+    runner.reranker = reranker
+
+    units = runner.graph_expand(
+        ["Alpha"],
+        hops=1,
+        limit_per_seed=1,
+        query="Alpha Beta",
+        apply_gate=False,
+    )
+
     assert [unit.title for unit in units] == ["Noise"]
     assert runner.graph_store.queries[0][1]["limit"] == 1
+    assert reranker.calls == []
+    assert "graph_gate" not in units[0].metadata
+
+
+def test_graph_expand_caps_rerank_pool_before_cross_encoder():
+    runner = PaperExperimentRunner(
+        RetrievalConfig(
+            require_neo4j=True,
+            max_graph_neighbors=5,
+            graph_expansion_limit_per_seed=5,
+            graph_rerank_candidate_cap=2,
+        )
+    )
+    runner.graph_store = MultiExpansionGraphStore(
+        [
+            {
+                "title": f"Candidate {idx}",
+                "content": f"Candidate {idx} mentions Alpha Beta bridge evidence.",
+                "sentences": [{"id": idx, "text": f"Candidate {idx} mentions Alpha Beta bridge evidence."}],
+                "path_entities": [["Alpha", "Beta", f"Candidate {idx}"]],
+            }
+            for idx in range(5)
+        ]
+    )
+    reranker = GraphGateReranker()
+    runner.reranker = reranker
+
+    units = runner.graph_expand(["Alpha"], hops=1, limit_per_seed=5, query="Alpha Beta")
+
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0][1]) == 2
+    assert len(units) == 2
 
 
 def test_parent_map_aggregates_trigger_sentence_positions_for_same_parent():
@@ -611,12 +840,13 @@ def test_fixed_graph_variant_uses_source_fixed_scale_candidate_flow():
 
     runner.rerank_units = fake_rerank
 
-    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True):
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True, apply_gate=True, seed_units=None):
         seen["titles"] = list(titles)
         seen["hops"] = hops
         seen["limit"] = limit_per_seed
         seen["query"] = query
         seen["use_snippet"] = use_snippet
+        seen["apply_gate"] = apply_gate
         return []
 
     runner.graph_expand = fake_graph_expand
@@ -631,6 +861,7 @@ def test_fixed_graph_variant_uses_source_fixed_scale_candidate_flow():
     assert seen["limit"] == runner.config.graph_expansion_limit_per_seed
     assert seen["query"] == "Alpha Beta"
     assert seen["use_snippet"] is False
+    assert seen["apply_gate"] is False
 
 
 def test_fixed_graph_variant_does_not_mix_in_parent_scale():
@@ -643,7 +874,7 @@ def test_fixed_graph_variant_does_not_mix_in_parent_scale():
     runner.vector_retrieve = lambda query, store_name, top_k=None: seeds
     runner.keyword_retrieve = lambda query, top_k=None: []
     runner.rerank_units = lambda query, units, top_k=None: list(units)
-    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="", use_snippet=True: [expanded]
+    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="", use_snippet=True, apply_gate=True, seed_units=None: [expanded]
     runner.parent_context_pool = lambda units: (_ for _ in ()).throw(
         AssertionError("fixed graph variants should isolate graph expansion from parent scale")
     )
@@ -762,11 +993,12 @@ def test_adaptive_graph_route_expands_the_full_reranked_b0_with_controlled_neigh
         },
     )
 
-    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True):
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", use_snippet=True, seed_units=None):
         seen["titles"] = list(titles)
         seen["limit"] = limit_per_seed
         seen["query"] = query
         seen["use_snippet"] = use_snippet
+        seen["seed_units"] = list(seed_units or [])
         return []
 
     runner.graph_expand = fake_graph_expand
@@ -777,6 +1009,7 @@ def test_adaptive_graph_route_expands_the_full_reranked_b0_with_controlled_neigh
     assert seen["limit"] == 5
     assert seen["query"] == "Alpha Beta bridge question"
     assert seen["use_snippet"] is True
+    assert seen["seed_units"] == seeds
 
 
 def test_graphrag_baseline_uses_source_seed_window_graph_expansion():
@@ -791,12 +1024,13 @@ def test_graphrag_baseline_uses_source_seed_window_graph_expansion():
         AssertionError("source GraphRAG slices initial+expanded directly")
     )
 
-    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True):
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True, apply_gate=True):
         seen["titles"] = list(titles)
         seen["hops"] = hops
         seen["limit"] = limit_per_seed
         seen["seed_limit"] = seed_limit
         seen["use_snippet"] = use_snippet
+        seen["apply_gate"] = apply_gate
         return []
 
     runner.graph_expand = fake_graph_expand
@@ -808,6 +1042,7 @@ def test_graphrag_baseline_uses_source_seed_window_graph_expansion():
     assert seen["limit"] == runner.config.graph_expansion_limit_per_seed
     assert seen["seed_limit"] == 3
     assert seen["use_snippet"] is False
+    assert seen["apply_gate"] is False
 
 
 def test_graph_route_summary_gate_counts_parent_and_expansion_not_initial_candidates():
@@ -834,7 +1069,7 @@ def test_graph_route_summary_gate_counts_parent_and_expansion_not_initial_candid
             "route": "graph_expansion",
         },
     )
-    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="": []
+    runner.graph_expand = lambda titles, hops=1, limit_per_seed=None, query="", seed_units=None: []
 
     def fake_summary(titles, query=""):
         called["titles"] = list(titles)
@@ -1155,13 +1390,14 @@ def test_graphrag_baseline_matches_source_file_seed_and_topk_flow():
         AssertionError("source GraphRAG takes all_units[:k3], not the proposed budget selector")
     )
 
-    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True):
+    def fake_graph_expand(titles, hops=1, limit_per_seed=None, query="", seed_limit=None, use_snippet=True, apply_gate=True):
         seen["titles"] = list(titles)
         seen["hops"] = hops
         seen["limit"] = limit_per_seed
         seen["seed_limit"] = seed_limit
         seen["query"] = query
         seen["use_snippet"] = use_snippet
+        seen["apply_gate"] = apply_gate
         return expanded
 
     runner.graph_expand = fake_graph_expand
@@ -1174,6 +1410,7 @@ def test_graphrag_baseline_matches_source_file_seed_and_topk_flow():
     assert seen["seed_limit"] == 3
     assert seen["query"] == "Alpha Beta"
     assert seen["use_snippet"] is False
+    assert seen["apply_gate"] is False
     assert [unit.id for unit in result.units] == [f"sent::{idx}" for idx in range(runner.config.k3)]
     assert result.stats["expanded_nodes"] == len(expanded)
 

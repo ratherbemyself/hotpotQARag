@@ -327,6 +327,37 @@ Most important mismatches:
 
 ## Recommended Next Decisions
 
+## Latest Graph-Ranking Redesign
+
+On 2026-07-09 the graph candidate filtering/ranking module was redesigned in `new_experiments/core.py`:
+
+- Proposed graph expansion now overfetches Neo4j neighbors, records graph path entities/path length, gates candidates with query/seed/path/missing-term signals, reranks only the capped candidate pool with the local CrossEncoder, then performs a diversity-aware final selection.
+- Source-compatible baselines (`GraphRAG`, `Fixed 1-hop`, `Fixed 2-hop`) explicitly call `graph_expand(..., apply_gate=False)` so the new Proposed graph-ranking logic does not silently strengthen or weaken baseline comparisons.
+- The default `graph_rerank_candidate_cap` is `12`, chosen after route-balanced retrieval diagnostics: it preserved graph recall while reducing expanded nodes and runtime versus the first reranked version.
+
+Verification:
+
+```powershell
+D:\cuda\venvs\vector-gpu\Scripts\python.exe -m pytest tests -q
+```
+
+Result: `72 passed, 3 warnings`.
+
+Retrieval-only route-balanced diagnostic:
+
+```text
+new_experiments\results\route_diagnostics_graph_rank_v4_cap12\route_diag_20260709_134309
+```
+
+Key graph-forced rows compared with the pre-redesign diagnostic:
+
+| Original route | Before Recall | After Recall | Before expanded | After expanded |
+|---|---:|---:|---:|---:|
+| graph_expansion | 0.6870 | 0.6924 | 25.24 | 11.72 |
+| local_parent forced graph | 0.8462 | 0.8629 | 16.99 | 11.67 |
+
+Interpretation: this makes graph expansion cleaner and mildly stronger, but it still does not fix the larger router problem by itself. The current heuristic routes only 46/300 balanced cases to graph expansion, while the counterfactual best route chooses graph for 26/300 cases.
+
 Do not mix these two experiment definitions:
 
 ### Option A: Source-Compatible Reproduction

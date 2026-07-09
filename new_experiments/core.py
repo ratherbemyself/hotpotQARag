@@ -56,6 +56,8 @@ class RetrievalConfig:
     max_graph_neighbors: int = 10
     graph_expansion_limit_per_seed: int = 5
     graph_expansion_snippet_chars: int = 450
+    graph_gate_min_score: float = 0.12
+    graph_rerank_candidate_cap: int = 12
     max_context_units: int = 20
 
     run_generation: bool = True
@@ -1209,17 +1211,22 @@ class PaperExperimentRunner:
         query: str = "",
         seed_limit: Optional[int] = None,
         use_snippet: bool = True,
+        seed_units: Optional[Sequence[EvidenceUnit]] = None,
+        apply_gate: bool = True,
     ) -> List[EvidenceUnit]:
         if self.graph_store is None:
             return []
 
         hops = max(1, min(int(hops), self.config.hmax))
         limit = limit_per_seed or self.config.graph_expansion_limit_per_seed
+        candidate_limit = max(int(limit), int(self.config.max_graph_neighbors)) if apply_gate else int(limit)
         max_degree = 500
         expanded: List[EvidenceUnit] = []
         seed_cap = seed_limit if seed_limit is not None else self.config.k3
         seed_titles = list(seed_titles)[: int(seed_cap)]
         seen = set(seed_titles)
+        seed_units_by_title = {unit.title: unit for unit in seed_units or [] if unit.title}
+        candidate_by_title: Dict[str, EvidenceUnit] = {}
 
         for title in seed_titles:
             cypher = f"""
@@ -1229,24 +1236,37 @@ class PaperExperimentRunner:
             MATCH (last)<-[:SEMANTIC_LINKS]-(n:Section)
             WHERE n <> start
               AND ALL(x IN nodes(p) WHERE COUNT {{ (x)--() }} <= $max_degree)
+            WITH DISTINCT n, p
             OPTIONAL MATCH (n)-[:HAS_PARAGRAPH]->(:Paragraph)-[:HAS_SENTENCE]->(sent:Sentence)
-            WITH n, collect({{id: toString(sent.sent_id), text: sent.text}}) AS sentences
-            RETURN DISTINCT n.title AS title, n.sentence_total AS content, sentences
+            WITH n,
+                 collect(DISTINCT {{id: toString(sent.sent_id), text: sent.text}}) AS sentences,
+                 collect(DISTINCT [x IN nodes(p) | coalesce(x.name, x.key, '')]) AS path_entities,
+                 min(length(p)) AS path_len
+            RETURN n.title AS title,
+                   n.sentence_total AS content,
+                   sentences,
+                   path_entities,
+                   path_len
+            ORDER BY path_len ASC
             LIMIT $limit
             """
             try:
                 rows = self.graph_store.query(
                     cypher,
-                    {"title": title, "max_degree": max_degree, "limit": limit},
+                    {"title": title, "max_degree": max_degree, "limit": candidate_limit},
                 )
             except Exception as exc:
                 logger.warning("Graph expansion failed for %s: %s", title, exc)
                 continue
 
+            local_seed_units = list(seed_units or [])
+            if title in seed_units_by_title:
+                local_seed_units = [seed_units_by_title[title]] + [unit for unit in local_seed_units if unit.title != title]
             for row in rows:
                 new_title = str(row.get("title", "")).strip('"')
                 raw_content = str(row.get("content", "") or self.title_to_content.get(new_title, ""))
                 sentence_rows = row.get("sentences", [])
+                path_entities = self.flatten_graph_path_entities(row.get("path_entities", []))
                 metadata: Dict[str, Any]
                 if use_snippet:
                     content, sentence_ids = self.extract_graph_evidence_snippet_with_ids(
@@ -1257,6 +1277,8 @@ class PaperExperimentRunner:
                     metadata = {
                         "snippet_source": "semantic_expansion",
                         "sentence_ids": sentence_ids,
+                        "path_entities": path_entities,
+                        "path_len": row.get("path_len"),
                     }
                 else:
                     content = raw_content.strip()
@@ -1265,24 +1287,264 @@ class PaperExperimentRunner:
                         "snippet_source": "full_graph_expansion",
                         "sentence_ids": sentence_ids,
                         "coverage": "title",
+                        "path_entities": path_entities,
+                        "path_len": row.get("path_len"),
                     }
                 if new_title and content and new_title not in seen:
-                    seen.add(new_title)
-                    expanded.append(
-                        EvidenceUnit(
-                            id=f"graph::{new_title}",
-                            title=new_title,
-                            content=content,
-                            score=0.55,
-                            source=f"graph_{hops}hop",
-                            granularity="paragraph",
-                            metadata=metadata,
-                        )
+                    candidate = EvidenceUnit(
+                        id=f"graph::{new_title}",
+                        title=new_title,
+                        content=content,
+                        score=0.55,
+                        source=f"graph_{hops}hop",
+                        granularity="paragraph",
+                        metadata=metadata,
                     )
+                    if not apply_gate:
+                        seen.add(new_title)
+                        expanded.append(candidate)
+                        continue
+
+                    gate = self.graph_candidate_gate(candidate, raw_content, query, local_seed_units)
+                    candidate.metadata["graph_gate"] = gate
+                    if gate["decision"] == "kept":
+                        candidate.score = 0.35 + min(0.60, float(gate["score"]))
+                        candidate.metadata["seed_title"] = title
+                        existing = candidate_by_title.get(new_title)
+                        existing_score = (
+                            float(existing.metadata.get("graph_gate", {}).get("score", 0.0))
+                            if existing is not None
+                            else float("-inf")
+                        )
+                        if existing is None or float(gate["score"]) > existing_score:
+                            candidate_by_title[new_title] = candidate
+
+        if apply_gate:
+            total_limit = int(limit) * max(1, len(seed_titles))
+            for unit in self.rank_graph_candidates(query, list(candidate_by_title.values()), list(seed_units or []), total_limit):
+                if unit.title in seen:
+                    continue
+                seen.add(unit.title)
+                expanded.append(unit)
         return expanded
 
     def graph_seed_titles(self, units: Sequence[EvidenceUnit]) -> List[str]:
         return [unit.title for unit in list(units)[: self.config.k3]]
+
+    @staticmethod
+    def flatten_graph_path_entities(value: Any) -> List[str]:
+        flattened: List[str] = []
+
+        def visit(item: Any) -> None:
+            if item is None:
+                return
+            if isinstance(item, (list, tuple, set)):
+                for child in item:
+                    visit(child)
+                return
+            text = str(item).strip()
+            if text and text not in flattened:
+                flattened.append(text)
+
+        visit(value)
+        return flattened
+
+    @staticmethod
+    def meaningful_terms(text: str) -> Set[str]:
+        stop = QueryComplexityScorer.QUESTION_WORDS | {
+            "also",
+            "been",
+            "being",
+            "both",
+            "does",
+            "did",
+            "had",
+            "has",
+            "have",
+            "into",
+            "its",
+            "new",
+            "same",
+            "than",
+            "that",
+            "their",
+            "then",
+            "there",
+            "these",
+            "this",
+            "those",
+            "was",
+            "were",
+            "while",
+            "whose",
+            "with",
+            "would",
+        }
+        terms = set()
+        for token in re.findall(r"[A-Za-z0-9]+", str(text or "").lower()):
+            if len(token) <= 2 or token in stop:
+                continue
+            terms.add(token)
+        return terms
+
+    def graph_candidate_gate(
+        self,
+        unit: EvidenceUnit,
+        raw_content: str,
+        query: str,
+        seed_units: Sequence[EvidenceUnit],
+    ) -> Dict[str, Any]:
+        query_terms = self.meaningful_terms(query)
+        seed_text = " ".join(f"{seed.title} {seed.content}" for seed in seed_units)
+        seed_terms = self.meaningful_terms(seed_text)
+        path_text = " ".join(str(entity) for entity in unit.metadata.get("path_entities", []))
+        path_terms = self.meaningful_terms(path_text)
+        candidate_terms = self.meaningful_terms(f"{unit.title} {unit.content} {raw_content}")
+
+        evidence_terms = candidate_terms | path_terms
+        query_hits = query_terms & evidence_terms
+        missing_query_terms = query_terms - seed_terms
+        missing_hits = missing_query_terms & evidence_terms
+        seed_hits = seed_terms & evidence_terms
+        path_query_hits = query_terms & path_terms
+
+        query_overlap = len(query_hits) / max(len(query_terms), 1) if query_terms else 0.0
+        missing_overlap = len(missing_hits) / max(len(missing_query_terms), 1) if missing_query_terms else 0.0
+        seed_anchor = min(1.0, len(seed_hits) / max(min(len(seed_terms), 8), 1)) if seed_terms else 0.0
+        path_entity_overlap = len(path_query_hits)
+        path_bonus = min(1.0, path_entity_overlap / 2.0)
+        length_penalty = min(0.12, unit.token_count / max(self.config.context_budget, 1) * 0.35)
+        score = (
+            0.42 * query_overlap
+            + 0.24 * missing_overlap
+            + 0.20 * path_bonus
+            + 0.14 * seed_anchor
+            - length_penalty
+        )
+        keep = (
+            score >= self.config.graph_gate_min_score
+            or path_entity_overlap > 0
+            or (query_overlap >= 0.20 and seed_anchor > 0)
+        )
+        return {
+            "decision": "kept" if keep else "dropped",
+            "score": round(float(score), 4),
+            "query_overlap": round(float(query_overlap), 4),
+            "missing_query_overlap": round(float(missing_overlap), 4),
+            "seed_anchor": round(float(seed_anchor), 4),
+            "path_entity_overlap": path_entity_overlap,
+            "query_hits": sorted(query_hits),
+            "missing_query_hits": sorted(missing_hits),
+            "path_query_hits": sorted(path_query_hits),
+        }
+
+    def graph_rerank_query(self, query: str, seed_units: Sequence[EvidenceUnit]) -> str:
+        seed_rows = []
+        for unit in list(seed_units)[: self.config.k3]:
+            seed_rows.append(f"- {unit.title}: {unit.content[:260]}")
+        if not seed_rows:
+            return query
+        return (
+            f"{query}\n\n"
+            "Initial evidence:\n"
+            + "\n".join(seed_rows)
+            + "\n\nPrefer graph evidence that adds a missing bridge fact or answers the question."
+        )
+
+    def rank_graph_candidates(
+        self,
+        query: str,
+        candidates: Sequence[EvidenceUnit],
+        seed_units: Sequence[EvidenceUnit],
+        limit: int,
+    ) -> List[EvidenceUnit]:
+        if not candidates:
+            return []
+        final_limit = max(0, int(limit))
+        if final_limit <= 0:
+            return []
+        cap = int(self.config.graph_rerank_candidate_cap)
+        if cap > 0:
+            final_limit = min(final_limit, cap)
+        ranked = sorted(
+            candidates,
+            key=lambda unit: (
+                float(unit.metadata.get("graph_gate", {}).get("score", 0.0)),
+                unit.score,
+            ),
+            reverse=True,
+        )
+        if self.reranker is None or len(ranked) <= 1:
+            return self.select_diverse_graph_candidates(query, ranked, seed_units, final_limit)
+
+        try:
+            rerank_pool = ranked[:final_limit]
+            search_results = [
+                RerankSearchResult(doc_id=unit.id, content=unit.content, score=unit.score, metadata={"unit": unit})
+                for unit in rerank_pool
+            ]
+            with self._rerank_semaphore:
+                reranked = self.reranker.rerank(
+                    self.graph_rerank_query(query, seed_units),
+                    search_results,
+                    top_k=min(final_limit, len(search_results)),
+                )
+            result = [row.metadata["unit"] for row in reranked]
+            for index, unit in enumerate(result):
+                unit.metadata.setdefault("graph_gate", {})["rerank_rank"] = index + 1
+                unit.score = float(getattr(reranked[index], "score", unit.score))
+            return self.select_diverse_graph_candidates(query, result, seed_units, final_limit)
+        except Exception as exc:
+            logger.warning("Graph candidate rerank failed; using graph gate scores: %s", exc)
+            return self.select_diverse_graph_candidates(query, ranked, seed_units, final_limit)
+
+    def select_diverse_graph_candidates(
+        self,
+        query: str,
+        candidates: Sequence[EvidenceUnit],
+        seed_units: Sequence[EvidenceUnit],
+        limit: int,
+    ) -> List[EvidenceUnit]:
+        if not candidates or limit <= 0:
+            return []
+
+        seed_terms = self.meaningful_terms(" ".join(f"{unit.title} {unit.content}" for unit in seed_units))
+        query_terms = self.meaningful_terms(query)
+        missing_query_terms = query_terms - seed_terms
+        selected: List[EvidenceUnit] = []
+        selected_terms: Set[str] = set(seed_terms)
+        remaining = list(candidates)
+        base_rank = {unit.id: index for index, unit in enumerate(remaining)}
+
+        while remaining and len(selected) < limit:
+            scored: List[Tuple[float, int, EvidenceUnit, Set[str]]] = []
+            for unit in remaining:
+                terms = self.meaningful_terms(f"{unit.title} {unit.content}")
+                graph_gate = unit.metadata.get("graph_gate", {})
+                gate_score = float(graph_gate.get("score", 0.0))
+                rerank_score = max(0.0, 1.0 - base_rank[unit.id] / max(len(candidates), 1))
+                missing_overlap = len(terms & missing_query_terms) / max(len(missing_query_terms), 1) if missing_query_terms else 0.0
+                query_overlap = len(terms & query_terms) / max(len(query_terms), 1) if query_terms else 0.0
+                novelty = len(terms - selected_terms) / max(len(terms), 1) if terms else 0.0
+                redundancy = len(terms & selected_terms) / max(len(terms), 1) if terms else 0.0
+                cost = unit.token_count / max(self.config.context_budget, 1)
+                value = (
+                    0.42 * rerank_score
+                    + 0.22 * gate_score
+                    + 0.16 * query_overlap
+                    + 0.14 * missing_overlap
+                    + 0.10 * novelty
+                    - 0.10 * redundancy
+                    - 0.08 * cost
+                )
+                scored.append((value, -base_rank[unit.id], unit, terms))
+
+            scored.sort(reverse=True)
+            _, _, chosen, terms = scored[0]
+            selected.append(chosen)
+            selected_terms.update(terms)
+            remaining = [unit for unit in remaining if unit.id != chosen.id]
+        return selected
 
     @staticmethod
     def sentence_ids_from_rows(sentence_rows: Optional[Sequence[Dict[str, Any]]]) -> List[str]:
@@ -1490,6 +1752,7 @@ class PaperExperimentRunner:
             query=query,
             seed_limit=3,
             use_snippet=False,
+            apply_gate=False,
         )
         units = (list(initial) + expanded)[: self.config.k3]
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route="graphrag"))
@@ -1561,6 +1824,7 @@ class PaperExperimentRunner:
                     hops=hops,
                     limit_per_seed=self.config.graph_expansion_limit_per_seed,
                     query=query,
+                    seed_units=reranked,
                 )
             
             all_candidates = list(reranked) + parent_units + expanded
@@ -1588,6 +1852,7 @@ class PaperExperimentRunner:
             limit_per_seed=self.config.graph_expansion_limit_per_seed,
             query=query,
             use_snippet=False,
+            apply_gate=False,
         )
         units = list(reranked) + expanded
         return MethodResult(units=units, stats=self._stats(start, units, expanded_nodes=len(expanded), route=f"fixed_{hops}hop"))

@@ -177,6 +177,7 @@ class RouteDiagnostics:
             hops=hops,
             limit_per_seed=self.runner.config.graph_expansion_limit_per_seed,
             query=query,
+            seed_units=reranked,
         )
         summaries: List[EvidenceUnit] = []
         current_tokens = sum(estimate_tokens(u.content) for u in parent_units + expanded)
